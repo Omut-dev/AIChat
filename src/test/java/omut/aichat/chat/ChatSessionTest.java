@@ -66,7 +66,7 @@ class ChatSessionTest {
     }
 
     /** Waits until the worker thread has finished both callbacks. */
-    private void awaitIdle() throws InterruptedException {
+    private void awaitIdle() {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
         while (System.nanoTime() < deadline) {
             if (listener.events.contains("thinkingFinished")
@@ -86,7 +86,7 @@ class ChatSessionTest {
      * listing what was actually seen, so a broken dispatch shows up
      * as a diagnostic, not as a mysterious timeout.
      */
-    private void awaitEvent(String name) throws InterruptedException {
+    private void awaitEvent(String name) {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
         while (System.nanoTime() < deadline) {
             if (listener.events.contains(name)) return;
@@ -260,7 +260,6 @@ class ChatSessionTest {
             CountDownLatch entered = new CountDownLatch(1);
             doAnswer(inv -> {
                 entered.countDown();
-                StreamingCallback cb = inv.getArgument(1);
                 boolean released = blocker.await(5, TimeUnit.SECONDS);
                 if (!released) {
                     throw new IllegalStateException("test did not release the worker");
@@ -346,6 +345,7 @@ class ChatSessionTest {
             assertThat(history).hasSize(2);
             assertThat(history.get(0).text()).isEqualTo("edited");
             assertThat(history.get(1).text()).isEqualTo("a2");
+            assertThat(listener.events).contains("message:USER");
         }
 
         @Test
@@ -603,11 +603,12 @@ class ChatSessionTest {
             assertThat(session.getHistory().getFirst().text())
                     .contains("[Attached: notes.txt]")
                     .contains("hello");
+            assertThat(listener.events).contains("message:SYSTEM");
         }
 
         @Test
         @DisplayName("Too large file emits an ERROR notice, nothing added")
-        void tooLarge() throws Exception {
+        void tooLarge() {
             when(config.attachMaxChars()).thenReturn(10);
             session.attachFile("big.txt", "0123456789ABCDEF");
             assertThat(session.getHistory()).isEmpty();
