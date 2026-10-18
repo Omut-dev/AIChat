@@ -310,6 +310,10 @@ document.addEventListener('contextmenu', function (e) {
         hideMenu();
         return;
     }
+    if (document.body.dataset.busy === 'true') {
+        hideMenu();
+        return;
+    }
     e.preventDefault();
     showMenu(e.clientX, e.clientY, msg.dataset.msgId,
         msg.dataset.msgEditable === 'true');

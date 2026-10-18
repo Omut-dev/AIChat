@@ -355,6 +355,32 @@ class ChatSessionTest {
             assertThat(session.getHistory()).isEmpty();
             verify(llm, never()).askStreaming(any(), any());
         }
+
+        @Test
+        @DisplayName("During an active request emits an INFO notice, does not edit")
+        void blockedWhileGenerating() throws Exception {
+            CountDownLatch blocker = new CountDownLatch(1);
+            CountDownLatch entered = new CountDownLatch(1);
+            doAnswer(inv -> {
+                entered.countDown();
+                StreamingCallback cb = inv.getArgument(1);
+                blocker.await(5, TimeUnit.SECONDS);
+                cb.onComplete(new LlmResponse("done", 10L, 1, 1_000_000L));
+                return null;
+            }).when(llm).askStreaming(any(), any());
+
+            session.send("original");
+            assertThat(entered.await(2, TimeUnit.SECONDS)).isTrue();
+
+            String userId = session.getHistory().getFirst().id();
+            session.editUserMessage(userId, "edited");
+            awaitEvent("notice:INFO");
+            assertThat(listener.lastNotice.get()).isEqualTo("Cannot edit while generating.");
+
+            blocker.countDown();
+            awaitIdle();
+            assertThat(session.getHistory().getFirst().text()).isEqualTo("original");
+        }
     }
 
     @Nested
@@ -388,6 +414,31 @@ class ChatSessionTest {
             String sysId = s.getHistory().getFirst().id();
             s.deleteFrom(sysId);
             assertThat(s.getHistory()).hasSize(1);
+        }
+
+        @Test
+        @DisplayName("During an active request emits an INFO notice, does not truncate")
+        void blockedWhileGenerating() throws Exception {
+            CountDownLatch blocker = new CountDownLatch(1);
+            CountDownLatch entered = new CountDownLatch(1);
+            doAnswer(inv -> {
+                entered.countDown();
+                StreamingCallback cb = inv.getArgument(1);
+                blocker.await(5, TimeUnit.SECONDS);
+                cb.onComplete(new LlmResponse("done", 10L, 1, 1_000_000L));
+                return null;
+            }).when(llm).askStreaming(any(), any());
+
+            session.send("hi");
+            assertThat(entered.await(2, TimeUnit.SECONDS)).isTrue();
+
+            session.deleteFrom("whatever");
+            awaitEvent("notice:INFO");
+            assertThat(listener.lastNotice.get()).isEqualTo("Cannot delete while generating.");
+
+            blocker.countDown();
+            awaitIdle();
+            assertThat(session.getHistory()).hasSize(2);
         }
     }
 

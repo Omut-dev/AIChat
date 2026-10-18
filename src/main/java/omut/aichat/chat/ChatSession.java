@@ -140,7 +140,10 @@ public class ChatSession implements ChatCommands {
     public void deleteFrom(String messageId) {
         if (messageId == null || messageId.isBlank()) return;
         if (executor.isShutdown()) return;
-        if (requestToken.get() != null) return;
+        if (requestToken.get() != null) {
+            dispatcher.notice("Cannot delete while generating.", NoticeLevel.INFO);
+            return;
+        }
 
         int idx = editor.indexOf(messageId);
         if (idx < 0) return;
@@ -155,7 +158,10 @@ public class ChatSession implements ChatCommands {
         if (messageId == null || messageId.isBlank()) return;
         if (newText == null || newText.isBlank()) return;
         if (executor.isShutdown()) return;
-        if (requestToken.get() != null) return;
+        if (requestToken.get() != null) {
+            dispatcher.notice("Cannot edit while generating.", NoticeLevel.INFO);
+            return;
+        }
 
         int idx = editor.indexOf(messageId);
         if (idx < 0) return;
