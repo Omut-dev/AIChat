@@ -170,6 +170,7 @@ public class ChatSession implements ChatCommands {
         editor.cutFrom(idx);
         AIChatMessage userMessage = AIChatMessage.user(newText.trim());
         editor.append(userMessage);
+        dispatcher.message(userMessage);
         dispatcher.historyChanged();
 
         Object token = new Object();
@@ -223,6 +224,7 @@ public class ChatSession implements ChatCommands {
             String text = "[Attached: " + fileName + "]\n\n" + content;
             AIChatMessage attachment = AIChatMessage.system(text);
             editor.append(attachment);
+            dispatcher.message(attachment);
             dispatcher.notice("Attached: " + fileName, NoticeLevel.SUCCESS);
         });
     }
