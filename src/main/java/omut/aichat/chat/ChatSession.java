@@ -283,6 +283,17 @@ public class ChatSession implements ChatCommands {
      * Prompt is likewise not part of this path — it belongs to the
      * active named prompt and is changed through
      * {@link #switchPrompt(String)} or the Settings → Prompts block.
+     * <p>
+     * Note on base URL: even though {@link AppSettings} does not carry
+     * a URL field, {@code rebuildModel()} reads the <i>current</i>
+     * {@link AppConfig#getBaseUrl()}. If the active server was changed
+     * in the Settings dialog (which mutates {@code AppConfig} directly
+     * before this method is called), the rebuild picks up the new URL.
+     * Do not remove the {@code rebuildModel()} call here on the
+     * assumption that it only handles temperature and timeout — it also
+     * commits a pending server switch. The explicit
+     * {@link #switchServer(String)} path exists for the toolbar
+     * selector, where no other config field changes.
      */
     public void applySettings(AppSettings settings) {
         if (settings == null) return;
