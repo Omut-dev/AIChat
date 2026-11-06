@@ -25,13 +25,16 @@
         <sonar.maven.plugin.version>5.5.0.6356</sonar.maven.plugin.version>
         <sonar.coverage.exclusions>src/main/java/omut/aichat/ui/**</sonar.coverage.exclusions>
 
+        <!-- Empty default for Surefire's @{argLine} when JaCoCo is skipped -->
+        <argLine><!-- filled by jacoco --></argLine>
+
         <!-- Dependencies -->
         <atlantafx-base.version>2.1.0</atlantafx-base.version>
         <commonmark.version>0.24.0</commonmark.version>
         <javafx.version>25.0.4</javafx.version>
         <slf4j-simple.version>2.0.16</slf4j-simple.version>
-        <langchain4j.version>1.21.0</langchain4j.version>
-        <jackson.version>2.22.3</jackson.version>
+        <langchain4j.version>1.23.0</langchain4j.version>
+        <jackson.version>2.22.4</jackson.version>
         <jackson.annotations.version>2.22</jackson.annotations.version>
         <jsoup.version>1.23.2</jsoup.version>
         <openpdf.version>2.0.3</openpdf.version>
