@@ -1,6 +1,5 @@
 package omut.aichat.service;
 
-import com.sun.net.httpserver.HttpServer;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.model.chat.StreamingChatModel;
 import dev.langchain4j.model.chat.response.ChatResponse;
@@ -15,12 +14,21 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
+import java.io.BufferedReader;
 import java.io.IOException;
-import java.net.InetSocketAddress;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -30,16 +38,130 @@ import static org.mockito.Mockito.*;
 
 class OllamaLlmServiceTest {
 
-    private HttpServer server;
+    /**
+     * Minimal stub HTTP server: for a given path, returns a fixed status + body.
+     * Enough for OllamaLlmService which only does GET /api/tags.
+     */
+    private static final class StubHttpServer implements AutoCloseable {
+        private final ServerSocket serverSocket;
+        private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
+            Thread t = new Thread(r, "stub-http");
+            t.setDaemon(true);
+            return t;
+        });
+        private final Map<String, Response> routes = new ConcurrentHashMap<>();
+        private volatile boolean running = true;
+
+        record Response(int status, String body) {}
+
+        StubHttpServer() throws IOException {
+            this.serverSocket = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
+            executor.submit(this::acceptLoop);
+        }
+
+        int port() {
+            return serverSocket.getLocalPort();
+        }
+
+        String baseUrl() {
+            return "http://127.0.0.1:" + port();
+        }
+
+        void route(String path, int status, String body) {
+            routes.put(path, new Response(status, body));
+        }
+
+        void route(String path, int status) {
+            route(path, status, "");
+        }
+
+        private void acceptLoop() {
+            while (running) {
+                try {
+                    Socket socket = serverSocket.accept();
+                    executor.submit(() -> handle(socket));
+                } catch (IOException e) {
+                    if (running) {
+                        // unexpected, but don't kill the loop
+                    }
+                }
+            }
+        }
+
+        private void handle(Socket socket) {
+            try (socket) {
+                BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(socket.getInputStream(), StandardCharsets.US_ASCII));
+                String requestLine = reader.readLine();
+                if (requestLine == null) {
+                    return;
+                }
+                // Drain headers
+                String line;
+                while ((line = reader.readLine()) != null && !line.isEmpty()) {
+                    // ignore
+                }
+
+                String path = requestLine.split(" ")[1];
+                // strip query string if any
+                int q = path.indexOf('?');
+                if (q >= 0) {
+                    path = path.substring(0, q);
+                }
+
+                Response resp = routes.get(path);
+                if (resp == null) {
+                    resp = new Response(404, "");
+                }
+
+                byte[] bodyBytes = resp.body().getBytes(StandardCharsets.UTF_8);
+                String statusLine = "HTTP/1.1 " + resp.status() + " " + reason(resp.status()) + "\r\n";
+                String headers =
+                        "Content-Type: application/json\r\n" +
+                                "Content-Length: " + bodyBytes.length + "\r\n" +
+                                "Connection: close\r\n" +
+                                "\r\n";
+
+                OutputStream out = socket.getOutputStream();
+                out.write(statusLine.getBytes(StandardCharsets.US_ASCII));
+                out.write(headers.getBytes(StandardCharsets.US_ASCII));
+                out.write(bodyBytes);
+                out.flush();
+            } catch (IOException ignored) {
+                // client disconnected
+            }
+        }
+
+        private static String reason(int status) {
+            return switch (status) {
+                case 200 -> "OK";
+                case 404 -> "Not Found";
+                case 500 -> "Internal Server Error";
+                default -> "Status";
+            };
+        }
+
+        @Override
+        public void close() {
+            running = false;
+            try {
+                serverSocket.close();
+            } catch (IOException ignored) {
+                // ignore
+            }
+            executor.shutdownNow();
+        }
+    }
+
+    private StubHttpServer server;
     private AppConfig config;
 
     @BeforeEach
     void setUp() throws IOException {
-        server = HttpServer.create(new InetSocketAddress(0), 0);
-        server.start();
+        server = new StubHttpServer();
 
         config = mock(AppConfig.class);
-        when(config.getBaseUrl()).thenReturn(baseUrl());
+        when(config.getBaseUrl()).thenReturn(server.baseUrl());
         when(config.requestTimeoutMinutes()).thenReturn(5);
         when(config.temperature()).thenReturn(0.5);
     }
@@ -47,7 +169,7 @@ class OllamaLlmServiceTest {
     @AfterEach
     void tearDown() {
         if (server != null) {
-            server.stop(0);
+            server.close();
         }
     }
 
@@ -85,8 +207,8 @@ class OllamaLlmServiceTest {
         @Test
         @DisplayName("Returns false when the server is not listening")
         void connectionRefused() {
-            int port = server.getAddress().getPort();
-            server.stop(0);
+            int port = server.port();
+            server.close();
             server = null;
 
             when(config.getBaseUrl()).thenReturn("http://127.0.0.1:" + port);
@@ -103,21 +225,15 @@ class OllamaLlmServiceTest {
         @Test
         @DisplayName("Parses model names from /api/tags response")
         void parsesNames() {
-            server.createContext("/api/tags", exchange -> {
-                String body = """
-                        {
-                          "models": [
-                            {"name": "qwen2.5:7b"},
-                            {"name": "llama3.1:8b"},
-                            {"name": "gemma2:2b"}
-                          ]
-                        }
-                        """;
-                byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
-                exchange.sendResponseHeaders(200, bytes.length);
-                exchange.getResponseBody().write(bytes);
-                exchange.close();
-            });
+            server.route("/api/tags", 200, """
+                    {
+                      "models": [
+                        {"name": "qwen2.5:7b"},
+                        {"name": "llama3.1:8b"},
+                        {"name": "gemma2:2b"}
+                      ]
+                    }
+                    """);
 
             OllamaLlmService service = new OllamaLlmService(config, "qwen2.5:7b");
 
@@ -128,12 +244,7 @@ class OllamaLlmServiceTest {
         @Test
         @DisplayName("Returns empty list when models array is empty")
         void emptyModels() {
-            server.createContext("/api/tags", exchange -> {
-                byte[] bytes = "{\"models\":[]}".getBytes(StandardCharsets.UTF_8);
-                exchange.sendResponseHeaders(200, bytes.length);
-                exchange.getResponseBody().write(bytes);
-                exchange.close();
-            });
+            server.route("/api/tags", 200, "{\"models\":[]}");
 
             OllamaLlmService service = new OllamaLlmService(config, "qwen2.5:7b");
 
@@ -152,12 +263,7 @@ class OllamaLlmServiceTest {
         @Test
         @DisplayName("Returns empty list on malformed JSON")
         void malformedJson() {
-            server.createContext("/api/tags", exchange -> {
-                byte[] bytes = "not json".getBytes(StandardCharsets.UTF_8);
-                exchange.sendResponseHeaders(200, bytes.length);
-                exchange.getResponseBody().write(bytes);
-                exchange.close();
-            });
+            server.route("/api/tags", 200, "not json");
 
             OllamaLlmService service = new OllamaLlmService(config, "qwen2.5:7b");
 
@@ -167,8 +273,8 @@ class OllamaLlmServiceTest {
         @Test
         @DisplayName("Returns empty list when connection refused")
         void connectionRefused() {
-            int port = server.getAddress().getPort();
-            server.stop(0);
+            int port = server.port();
+            server.close();
             server = null;
 
             when(config.getBaseUrl()).thenReturn("http://127.0.0.1:" + port);
@@ -248,10 +354,6 @@ class OllamaLlmServiceTest {
     @DisplayName("askStreaming")
     class AskStreaming {
 
-        /**
-         * Builds a service whose streaming model completes synchronously
-         * by emitting the given chunks then a final response.
-         */
         private OllamaLlmService serviceWithStream(String... chunks) {
             StreamingChatModel model = mock(StreamingChatModel.class);
 
@@ -364,14 +466,7 @@ class OllamaLlmServiceTest {
         }
     }
 
-    private String baseUrl() {
-        return "http://127.0.0.1:" + server.getAddress().getPort();
-    }
-
     private void respondWith(int status) {
-        server.createContext("/api/tags", exchange -> {
-            exchange.sendResponseHeaders(status, -1);
-            exchange.close();
-        });
+        server.route("/api/tags", status);
     }
 }
