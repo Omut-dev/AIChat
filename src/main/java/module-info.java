@@ -2,7 +2,6 @@ module omut.aichat {
     // JDK modules
     requires java.desktop;
     requires java.net.http;
-    requires jdk.httpserver;
     requires jdk.jsobject;
 
     // Third-party modules
