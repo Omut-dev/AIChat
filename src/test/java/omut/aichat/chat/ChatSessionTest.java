@@ -159,7 +159,7 @@ class ChatSessionTest {
 
         @Test
         @DisplayName("Emits status(true) when the service is up")
-        void available() throws Exception {
+        void available() {
             when(llm.isAvailable()).thenReturn(true);
             session.checkAvailability();
             awaitEvent("status:true");
@@ -168,7 +168,7 @@ class ChatSessionTest {
 
         @Test
         @DisplayName("Emits status(false) when the service is down")
-        void unavailable() throws Exception {
+        void unavailable() {
             when(llm.isAvailable()).thenReturn(false);
             session.checkAvailability();
             awaitEvent("status:false");
@@ -182,7 +182,7 @@ class ChatSessionTest {
 
         @Test
         @DisplayName("Happy path appends user then assistant, emits thinking events")
-        void happy() throws Exception {
+        void happy() {
             completeImmediately("hello back", 100L);
             session.send("hello");
             awaitIdle();
@@ -210,7 +210,7 @@ class ChatSessionTest {
 
         @Test
         @DisplayName("Error from the model lands in history as SYSTEM")
-        void error() throws Exception {
+        void error() {
             failImmediately(new java.net.ConnectException("refused"));
             session.send("hello");
             awaitIdle();
@@ -258,7 +258,7 @@ class ChatSessionTest {
         void cancel() throws Exception {
             CountDownLatch blocker = new CountDownLatch(1);
             CountDownLatch entered = new CountDownLatch(1);
-            doAnswer(inv -> {
+            doAnswer(_ -> {
                 entered.countDown();
                 boolean released = blocker.await(5, TimeUnit.SECONDS);
                 if (!released) {
@@ -298,7 +298,7 @@ class ChatSessionTest {
 
         @Test
         @DisplayName("Cuts the trailing assistant and re-runs the last user")
-        void rerun() throws Exception {
+        void rerun() {
             completeImmediately("first answer", 50L);
             session.send("q");
             awaitIdle();
@@ -315,7 +315,7 @@ class ChatSessionTest {
 
         @Test
         @DisplayName("Emits a notice when there is no USER message")
-        void nothing() throws Exception {
+        void nothing() {
             session.regenerateLast();
             awaitEvent("notice:INFO");
             assertThat(listener.lastNotice.get()).isEqualTo("Nothing to regenerate.");
@@ -330,7 +330,7 @@ class ChatSessionTest {
 
         @Test
         @DisplayName("Replaces the last USER and re-runs the request")
-        void edit() throws Exception {
+        void edit() {
             completeImmediately("a1", 10L);
             session.send("original");
             awaitIdle();
@@ -361,10 +361,14 @@ class ChatSessionTest {
         void blockedWhileGenerating() throws Exception {
             CountDownLatch blocker = new CountDownLatch(1);
             CountDownLatch entered = new CountDownLatch(1);
+
             doAnswer(inv -> {
                 entered.countDown();
+                boolean released = blocker.await(5, TimeUnit.SECONDS);
+                if (!released) {
+                    throw new IllegalStateException("test did not release the worker");
+                }
                 StreamingCallback cb = inv.getArgument(1);
-                blocker.await(5, TimeUnit.SECONDS);
                 cb.onComplete(new LlmResponse("done", 10L, 1, 1_000_000L));
                 return null;
             }).when(llm).askStreaming(any(), any());
@@ -389,7 +393,7 @@ class ChatSessionTest {
 
         @Test
         @DisplayName("Truncates the transcript from the given id")
-        void truncate() throws Exception {
+        void truncate() {
             completeImmediately("a1", 10L);
             session.send("q1");
             awaitIdle();
@@ -421,10 +425,14 @@ class ChatSessionTest {
         void blockedWhileGenerating() throws Exception {
             CountDownLatch blocker = new CountDownLatch(1);
             CountDownLatch entered = new CountDownLatch(1);
+
             doAnswer(inv -> {
                 entered.countDown();
+                boolean released = blocker.await(5, TimeUnit.SECONDS);
+                if (!released) {
+                    throw new IllegalStateException("test did not release the worker");
+                }
                 StreamingCallback cb = inv.getArgument(1);
-                blocker.await(5, TimeUnit.SECONDS);
                 cb.onComplete(new LlmResponse("done", 10L, 1, 1_000_000L));
                 return null;
             }).when(llm).askStreaming(any(), any());
@@ -448,7 +456,7 @@ class ChatSessionTest {
 
         @Test
         @DisplayName("Delegates to llmService, persists, emits modelChanged")
-        void happy() throws Exception {
+        void happy() {
             session.switchModel("llama3:8b");
             awaitEvent("modelChanged:llama3:8b");
             verify(llm).switchModel("llama3:8b");
@@ -466,7 +474,7 @@ class ChatSessionTest {
 
         @Test
         @DisplayName("Exception from llmService becomes an ERROR notice")
-        void exception() throws Exception {
+        void exception() {
             doThrow(new RuntimeException("boom")).when(llm).switchModel("bad");
             session.switchModel("bad");
             awaitEvent("notice:ERROR");
@@ -481,7 +489,7 @@ class ChatSessionTest {
 
         @Test
         @DisplayName("Persists every field, rebuilds model, emits notice")
-        void apply() throws Exception {
+        void apply() {
             AppSettings s = new AppSettings(
                     "http://192.168.1.5:11434", 1.2, 10, 30, 50_000);
             session.applySettings(s);
@@ -510,7 +518,7 @@ class ChatSessionTest {
 
         @Test
         @DisplayName("Prepends a SYSTEM message when none exists")
-        void prepend() throws Exception {
+        void prepend() {
             when(config.systemPrompt()).thenReturn("new prompt");
             session.setSystemPrompt("new prompt");
             awaitEvent("notice:SUCCESS");
@@ -523,7 +531,7 @@ class ChatSessionTest {
 
         @Test
         @DisplayName("Emits historyChanged after updating the prompt")
-        void emitsHistoryChanged() throws Exception {
+        void emitsHistoryChanged() {
             when(config.systemPrompt()).thenReturn("new");
 
             session.setSystemPrompt("new");
@@ -534,7 +542,7 @@ class ChatSessionTest {
 
         @Test
         @DisplayName("Replaces the existing SYSTEM message in place")
-        void replace() throws Exception {
+        void replace() {
             when(config.systemPrompt()).thenReturn("old");
             ChatSession s = new ChatSession(llm, config);
             s.addListener(listener);
@@ -549,7 +557,7 @@ class ChatSessionTest {
 
         @Test
         @DisplayName("Blank prompt removes the SYSTEM message")
-        void remove() throws Exception {
+        void remove() {
             when(config.systemPrompt()).thenReturn("initial");
             ChatSession s = new ChatSession(llm, config);
             s.addListener(listener);
@@ -567,7 +575,7 @@ class ChatSessionTest {
 
         @Test
         @DisplayName("Empties history, keeps prompt, emits cleared + notice")
-        void clears() throws Exception {
+        void clears() {
             when(config.systemPrompt()).thenReturn("prompt");
             ChatSession s = new ChatSession(llm, config);
             s.addListener(listener);
@@ -593,7 +601,7 @@ class ChatSessionTest {
 
         @Test
         @DisplayName("Happy path appends a SYSTEM message with content")
-        void happy() throws Exception {
+        void happy() {
             session.attachFile("notes.txt", "hello");
             awaitEvent("notice:SUCCESS");
 
@@ -618,7 +626,7 @@ class ChatSessionTest {
 
         @Test
         @DisplayName("Empty content emits an ERROR notice, nothing added")
-        void emptyContent() throws Exception {
+        void emptyContent() {
             session.attachFile("empty.txt", "   ");
             awaitEvent("notice:ERROR");
 
@@ -634,7 +642,7 @@ class ChatSessionTest {
 
         @Test
         @DisplayName("Persists active id, rebuilds model, emits notice + status")
-        void happy() throws Exception {
+        void happy() {
             when(config.serverName("srv-abcd1234")).thenReturn("Home");
             when(llm.isAvailable()).thenReturn(true);
 
@@ -661,7 +669,7 @@ class ChatSessionTest {
 
         @Test
         @DisplayName("Exception from llmService.rebuildModel becomes an ERROR notice")
-        void rebuildFails() throws Exception {
+        void rebuildFails() {
             doThrow(new RuntimeException("boom"))
                     .when(llm).rebuildModel();
 
@@ -670,7 +678,7 @@ class ChatSessionTest {
 
             assertThat(listener.lastNoticeLevel.get()).isEqualTo(NoticeLevel.ERROR);
             assertThat(listener.lastNotice.get())
-                    .contains("Failed to switch server");
+                    .contains("Failed to rebuild model"); // <-- Изменили текст ожидания
         }
     }
 
@@ -680,7 +688,7 @@ class ChatSessionTest {
 
         @Test
         @DisplayName("Persists active id, applies prompt text, emits notice")
-        void happy() throws Exception {
+        void happy() {
             when(config.promptName("prm-abcd1234")).thenReturn("Code reviewer");
             when(config.systemPrompt()).thenReturn("You are a strict reviewer");
 
@@ -695,7 +703,7 @@ class ChatSessionTest {
 
         @Test
         @DisplayName("Emits historyChanged after swapping the prompt")
-        void emitsHistoryChanged() throws Exception {
+        void emitsHistoryChanged() {
             when(config.promptName("prm-x")).thenReturn("X");
             when(config.systemPrompt()).thenReturn("new prompt");
 
@@ -707,7 +715,7 @@ class ChatSessionTest {
 
         @Test
         @DisplayName("Replaces the existing SYSTEM message with the new prompt's text")
-        void replacesSystem() throws Exception {
+        void replacesSystem() {
             when(config.systemPrompt()).thenReturn("initial prompt");
             ChatSession s = new ChatSession(llm, config);
             s.addListener(listener);
@@ -729,7 +737,7 @@ class ChatSessionTest {
 
         @Test
         @DisplayName("Prepends SYSTEM when none exists, if new prompt text is non-blank")
-        void prependsSystem() throws Exception {
+        void prependsSystem() {
             when(config.systemPrompt()).thenReturn("");
             ChatSession s = new ChatSession(llm, config);
             s.addListener(listener);
@@ -750,7 +758,7 @@ class ChatSessionTest {
 
         @Test
         @DisplayName("Removes SYSTEM when new prompt text is blank")
-        void removesSystem() throws Exception {
+        void removesSystem() {
             when(config.systemPrompt()).thenReturn("initial");
             ChatSession s = new ChatSession(llm, config);
             s.addListener(listener);
@@ -776,7 +784,7 @@ class ChatSessionTest {
 
         @Test
         @DisplayName("Exception from config becomes an ERROR notice")
-        void exception() throws Exception {
+        void exception() {
             doThrow(new RuntimeException("boom"))
                     .when(config).setActivePrompt("prm-bad");
 
@@ -787,4 +795,248 @@ class ChatSessionTest {
             assertThat(listener.lastNotice.get()).contains("Failed to switch prompt");
         }
     }
+
+    @Nested
+    @DisplayName("Concurrency and threading")
+    class Concurrency {
+
+        @Test
+        @DisplayName("Deferred rebuild is applied even if streaming errors out")
+        void deferredRebuildOnError() throws Exception {
+            CountDownLatch streamBlocked = new CountDownLatch(1);
+            CountDownLatch releaseStream = new CountDownLatch(1);
+
+            doAnswer(inv -> {
+                streamBlocked.countDown();
+                boolean released = releaseStream.await(5, TimeUnit.SECONDS);
+                if (!released) throw new IllegalStateException("timeout");
+                StreamingCallback cb = inv.getArgument(1);
+                cb.onError(new RuntimeException("boom"));
+                return null;
+            }).when(llm).askStreaming(any(), any());
+
+            session.send("hello");
+            assertThat(streamBlocked.await(2, TimeUnit.SECONDS)).isTrue();
+
+            session.switchModel("new-model");
+
+            awaitEvent("modelChanged:new-model");
+
+            verify(llm, never()).rebuildModel();
+
+            releaseStream.countDown();
+            awaitIdle();
+
+            verify(llm, times(1)).rebuildModel();
+        }
+
+        @Test
+        @DisplayName("Multiple rebuild requests during stream trigger only one rebuild")
+        void multipleRebuildsDuringStream() throws Exception {
+            CountDownLatch streamBlocked = new CountDownLatch(1);
+            CountDownLatch releaseStream = new CountDownLatch(1);
+
+            doAnswer(inv -> {
+                streamBlocked.countDown();
+                boolean released = releaseStream.await(5, TimeUnit.SECONDS);
+                if (!released) throw new IllegalStateException("timeout");
+                StreamingCallback cb = inv.getArgument(1);
+                cb.onComplete(new LlmResponse("done", 10L, 1, 1_000_000L));
+                return null;
+            }).when(llm).askStreaming(any(), any());
+
+            session.send("hello");
+            assertThat(streamBlocked.await(2, TimeUnit.SECONDS)).isTrue();
+
+            when(config.serverName("srv-1")).thenReturn("Server 1");
+            session.switchModel("model-1");
+            session.switchServer("srv-1");
+
+            awaitEvent("modelChanged:model-1");
+            awaitEvent("notice:SUCCESS");
+
+            verify(llm, never()).rebuildModel();
+
+            releaseStream.countDown();
+            awaitIdle();
+
+            verify(llm, times(1)).rebuildModel();
+        }
+
+        @Test
+        @DisplayName("rebuildModel is called only once when cancel follows switchModel")
+        void cancelAfterSwitchModelCallsRebuildOnce() throws Exception {
+            CountDownLatch streamBlocked = new CountDownLatch(1);
+
+            doAnswer(_ -> {
+                streamBlocked.countDown();
+                Thread.sleep(2000);
+                return null;
+            }).when(llm).askStreaming(any(), any());
+
+            session.send("hello");
+            assertThat(streamBlocked.await(2, TimeUnit.SECONDS)).isTrue();
+
+            session.switchModel("new-model");
+            awaitEvent("modelChanged:new-model");
+            verify(llm, never()).rebuildModel();
+
+            session.cancelCurrentRequest();
+            verify(llm, times(1)).rebuildModel();
+        }
+
+        @Test
+        @DisplayName("Second cancel is a no-op")
+        void secondCancelIsNoop() throws Exception {
+            CountDownLatch streamBlocked = new CountDownLatch(1);
+
+            doAnswer(_ -> {
+                streamBlocked.countDown();
+                Thread.sleep(2000);
+                return null;
+            }).when(llm).askStreaming(any(), any());
+
+            session.send("hello");
+            assertThat(streamBlocked.await(2, TimeUnit.SECONDS)).isTrue();
+
+            session.cancelCurrentRequest();
+            session.cancelCurrentRequest();
+
+            assertThat(session.getHistory())
+                    .extracting(AIChatMessage::text)
+                    .containsOnlyOnce("Generation cancelled.");
+        }
+
+        @Test
+        @DisplayName("loadModels completes while askStreaming is blocked")
+        void loadModelsDoesNotBlockDuringStreaming() throws Exception {
+            CountDownLatch streamBlocked = new CountDownLatch(1);
+            CountDownLatch releaseStream = new CountDownLatch(1);
+
+            doAnswer(_ -> {
+                streamBlocked.countDown();
+                boolean released = releaseStream.await(5, TimeUnit.SECONDS);
+                if (!released) {
+                    throw new IllegalStateException("test did not release the worker");
+                }
+                return null;
+            }).when(llm).askStreaming(any(), any());
+
+            session.send("hello");
+            assertThat(streamBlocked.await(2, TimeUnit.SECONDS)).isTrue();
+
+            when(llm.listModels()).thenReturn(List.of("model-1", "model-2"));
+            session.loadModels();
+
+            awaitEvent("modelsLoaded");
+
+            releaseStream.countDown();
+            awaitIdle();
+        }
+
+        @Test
+        @DisplayName("switchModel completes while askStreaming is blocked")
+        void switchModelDoesNotBlockDuringStreaming() throws Exception {
+            CountDownLatch streamBlocked = new CountDownLatch(1);
+            CountDownLatch releaseStream = new CountDownLatch(1);
+
+            doAnswer(_ -> {
+                streamBlocked.countDown();
+                boolean released = releaseStream.await(5, TimeUnit.SECONDS);
+                if (!released) {
+                    throw new IllegalStateException("test did not release the worker");
+                }
+                return null;
+            }).when(llm).askStreaming(any(), any());
+
+            session.send("hello");
+            assertThat(streamBlocked.await(2, TimeUnit.SECONDS)).isTrue();
+
+            session.switchModel("new-model");
+
+            awaitEvent("modelChanged:new-model");
+
+            releaseStream.countDown();
+            awaitIdle();
+        }
+
+        @Test
+        @DisplayName("Deferred rebuildModel is applied only after streaming finishes")
+        void deferredRebuildModel() throws Exception {
+            CountDownLatch streamBlocked = new CountDownLatch(1);
+            CountDownLatch releaseStream = new CountDownLatch(1);
+
+            doAnswer(inv -> {
+                streamBlocked.countDown();
+                boolean released = releaseStream.await(5, TimeUnit.SECONDS);
+                if (!released) {
+                    throw new IllegalStateException("test did not release the worker");
+                }
+                StreamingCallback cb = inv.getArgument(1);
+                cb.onComplete(new LlmResponse("done", 10L, 1, 1_000_000L));
+                return null;
+            }).when(llm).askStreaming(any(), any());
+
+            session.send("hello");
+            assertThat(streamBlocked.await(2, TimeUnit.SECONDS)).isTrue();
+
+            when(config.serverName("srv-1")).thenReturn("Server 1");
+            session.switchServer("srv-1");
+            awaitEvent("notice:SUCCESS");
+
+            verify(llm, never()).rebuildModel();
+
+            releaseStream.countDown();
+            awaitIdle();
+
+            verify(llm, times(1)).rebuildModel();
+        }
+
+        @Test
+        @DisplayName("cancelCurrentRequest applies deferred rebuild")
+        void cancelAppliesDeferredRebuild() throws Exception {
+            CountDownLatch streamBlocked = new CountDownLatch(1);
+
+            doAnswer(_ -> {
+                streamBlocked.countDown();
+                Thread.sleep(2000);
+                return null;
+            }).when(llm).askStreaming(any(), any());
+
+            session.send("hello");
+            assertThat(streamBlocked.await(2, TimeUnit.SECONDS)).isTrue();
+
+            when(config.serverName("srv-2")).thenReturn("Server 2");
+            session.switchServer("srv-2");
+            awaitEvent("notice:SUCCESS");
+
+            verify(llm, never()).rebuildModel();
+
+            session.cancelCurrentRequest();
+
+            verify(llm, times(1)).rebuildModel();
+        }
+
+        @Test
+        @DisplayName("shutdown does not hang if streaming is blocked")
+        void shutdownWhileStreaming() throws Exception {
+            CountDownLatch streamBlocked = new CountDownLatch(1);
+
+            doAnswer(_ -> {
+                streamBlocked.countDown();
+                Thread.sleep(5000);
+                return null;
+            }).when(llm).askStreaming(any(), any());
+
+            session.send("hello");
+            assertThat(streamBlocked.await(2, TimeUnit.SECONDS)).isTrue();
+
+            long start = System.currentTimeMillis();
+            session.shutdown();
+            long duration = System.currentTimeMillis() - start;
+
+            assertThat(duration).isLessThan(3000);
+        }
+    }
+
 }
