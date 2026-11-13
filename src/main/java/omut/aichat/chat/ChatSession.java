@@ -8,6 +8,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.List;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 public class ChatSession implements ChatCommands {
@@ -16,12 +17,17 @@ public class ChatSession implements ChatCommands {
 
     private final AtomicReference<Future<?>> currentRequest = new AtomicReference<>();
     private final AtomicReference<Object> requestToken = new AtomicReference<>();
+    private final AtomicBoolean pendingRebuild = new AtomicBoolean(false);
+
     private final LlmService llmService;
     private final AppConfig config;
     private final ChatDispatcher dispatcher = new ChatDispatcher();
     private final HistoryEditor editor = new HistoryEditor();
-    private final ExecutorService executor = Executors.newSingleThreadExecutor(
+
+    private final ExecutorService chatWorker = Executors.newSingleThreadExecutor(
             r -> new Thread(r, "chat-worker"));
+    private final ExecutorService metaWorker = Executors.newSingleThreadExecutor(
+            r -> new Thread(r, "meta-worker"));
 
     public ChatSession(LlmService llmService, AppConfig config) {
         this.llmService = llmService;
@@ -41,12 +47,12 @@ public class ChatSession implements ChatCommands {
     }
 
     public void checkAvailability() {
-        submit(() -> dispatcher.status(llmService.isAvailable()));
+        submit(metaWorker, () -> dispatcher.status(llmService.isAvailable()));
     }
 
     public void send(String userText) {
         if (userText == null || userText.isBlank()) return;
-        if (executor.isShutdown()) return;
+        if (chatWorker.isShutdown()) return;
         if (requestToken.get() != null) return;
 
         AIChatMessage userMessage = AIChatMessage.user(userText.trim());
@@ -63,7 +69,7 @@ public class ChatSession implements ChatCommands {
 
     private void submitStreamingRequest(Object token) {
         try {
-            Future<?> future = executor.submit(() -> {
+            Future<?> future = chatWorker.submit(() -> {
                 long start = System.nanoTime();
                 try {
                     List<AIChatMessage> requestHistory =
@@ -106,6 +112,7 @@ public class ChatSession implements ChatCommands {
                     if (requestToken.compareAndSet(token, null)) {
                         currentRequest.set(null);
                         dispatcher.thinkingFinished();
+                        applyDeferredRebuild();
                     }
                 }
             });
@@ -117,7 +124,7 @@ public class ChatSession implements ChatCommands {
     }
 
     public void regenerateLast() {
-        if (executor.isShutdown()) return;
+        if (chatWorker.isShutdown()) return;
         if (requestToken.get() != null) return;
 
         int lastUserIndex = editor.lastUserIndex();
@@ -139,7 +146,7 @@ public class ChatSession implements ChatCommands {
     @Override
     public void deleteFrom(String messageId) {
         if (messageId == null || messageId.isBlank()) return;
-        if (executor.isShutdown()) return;
+        if (chatWorker.isShutdown()) return;
         if (requestToken.get() != null) {
             dispatcher.notice("Cannot delete while generating.", NoticeLevel.INFO);
             return;
@@ -157,7 +164,7 @@ public class ChatSession implements ChatCommands {
     public void editUserMessage(String messageId, String newText) {
         if (messageId == null || messageId.isBlank()) return;
         if (newText == null || newText.isBlank()) return;
-        if (executor.isShutdown()) return;
+        if (chatWorker.isShutdown()) return;
         if (requestToken.get() != null) {
             dispatcher.notice("Cannot edit while generating.", NoticeLevel.INFO);
             return;
@@ -180,7 +187,7 @@ public class ChatSession implements ChatCommands {
     }
 
     public void loadModels() {
-        submit(() -> {
+        submit(metaWorker, () -> {
             List<String> models = llmService.listModels();
             dispatcher.modelsLoaded(models);
         });
@@ -191,7 +198,10 @@ public class ChatSession implements ChatCommands {
             dispatcher.notice("Invalid model name.", NoticeLevel.ERROR);
             return;
         }
-        submit(() -> {
+
+        requestRebuild();
+
+        submit(metaWorker, () -> {
             try {
                 llmService.switchModel(modelName);
                 config.setSelectedModel(modelName);
@@ -220,7 +230,7 @@ public class ChatSession implements ChatCommands {
             return;
         }
 
-        submit(() -> {
+        submit(chatWorker, () -> {
             String text = "[Attached: " + fileName + "]\n\n" + content;
             AIChatMessage attachment = AIChatMessage.system(text);
             editor.append(attachment);
@@ -230,7 +240,7 @@ public class ChatSession implements ChatCommands {
     }
 
     public void clear() {
-        submit(() -> {
+        submit(chatWorker, () -> {
             editor.clear();
             String prompt = config.systemPrompt();
             if (!prompt.isBlank()) {
@@ -242,10 +252,14 @@ public class ChatSession implements ChatCommands {
     }
 
     public void shutdown() {
-        executor.shutdownNow();
+        chatWorker.shutdownNow();
+        metaWorker.shutdownNow();
         try {
-            if (!executor.awaitTermination(2, TimeUnit.SECONDS)) {
+            if (!chatWorker.awaitTermination(2, TimeUnit.SECONDS)) {
                 log.warn("chat-worker did not terminate within 2 seconds");
+            }
+            if (!metaWorker.awaitTermination(2, TimeUnit.SECONDS)) {
+                log.warn("meta-worker did not terminate within 2 seconds");
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -268,42 +282,21 @@ public class ChatSession implements ChatCommands {
         dispatcher.message(cancelNote);
         dispatcher.requestCancelled();
         dispatcher.thinkingFinished();
+        applyDeferredRebuild();
     }
 
-    /**
-     * Applies a full settings snapshot atomically on the worker thread:
-     * persists each value through {@link AppConfig}, then rebuilds the
-     * streaming model so temperature and timeout changes take effect
-     * without restart.
-     * <p>
-     * Base URL is intentionally not part of this path. It belongs to
-     * the active named server and is changed through
-     * {@link #switchServer(String)} or the Settings → Servers block.
-     * <p>
-     * Prompt is likewise not part of this path — it belongs to the
-     * active named prompt and is changed through
-     * {@link #switchPrompt(String)} or the Settings → Prompts block.
-     * <p>
-     * Note on base URL: even though {@link AppSettings} does not carry
-     * a URL field, {@code rebuildModel()} reads the <i>current</i>
-     * {@link AppConfig#getBaseUrl()}. If the active server was changed
-     * in the Settings dialog (which mutates {@code AppConfig} directly
-     * before this method is called), the rebuild picks up the new URL.
-     * Do not remove the {@code rebuildModel()} call here on the
-     * assumption that it only handles temperature and timeout — it also
-     * commits a pending server switch. The explicit
-     * {@link #switchServer(String)} path exists for the toolbar
-     * selector, where no other config field changes.
-     */
     public void applySettings(AppSettings settings) {
         if (settings == null) return;
-        submit(() -> {
+
+        requestRebuild();
+
+        submit(metaWorker, () -> {
             try {
                 config.setTemperature(settings.temperature());
                 config.setRequestTimeoutMinutes(settings.requestTimeoutMinutes());
                 config.setHistoryMaxMessages(settings.historyMaxMessages());
                 config.setAttachMaxChars(settings.attachMaxChars());
-                llmService.rebuildModel();
+
                 dispatcher.notice("Settings saved.", NoticeLevel.SUCCESS);
                 dispatcher.status(llmService.isAvailable());
             } catch (Exception e) {
@@ -313,17 +306,15 @@ public class ChatSession implements ChatCommands {
         });
     }
 
-    /**
-     * Switches to another named Ollama server, rebuilds the streaming
-     * model against its URL, and re-checks availability. The active
-     * server is persisted through {@link AppConfig}.
-     */
     public void switchServer(String serverId) {
         if (serverId == null || serverId.isBlank()) return;
-        submit(() -> {
+
+        requestRebuild();
+
+        submit(metaWorker, () -> {
             try {
                 config.setActiveServer(serverId);
-                llmService.rebuildModel();
+
                 dispatcher.notice(
                         "Switched to server: " + config.serverName(serverId),
                         NoticeLevel.SUCCESS);
@@ -335,18 +326,9 @@ public class ChatSession implements ChatCommands {
         });
     }
 
-    /**
-     * Switches to another named prompt and applies its text to the
-     * SYSTEM message in the current transcript. The active prompt is
-     * persisted through {@link AppConfig}.
-     * <p>
-     * Unlike {@link #switchServer(String)} this does not touch the
-     * streaming model — the prompt only affects the next request's
-     * message list, not the model configuration.
-     */
     public void switchPrompt(String promptId) {
         if (promptId == null || promptId.isBlank()) return;
-        submit(() -> {
+        submit(chatWorker, () -> {
             try {
                 config.setActivePrompt(promptId);
                 applySystemPromptToHistory(config.systemPrompt());
@@ -361,12 +343,8 @@ public class ChatSession implements ChatCommands {
         });
     }
 
-    /**
-     * Updates the active prompt's text and applies it to the SYSTEM
-     * message in the current transcript.
-     */
     public void setSystemPrompt(String prompt) {
-        submit(() -> {
+        submit(chatWorker, () -> {
             try {
                 config.setSystemPrompt(prompt);
                 applySystemPromptToHistory(config.systemPrompt());
@@ -394,12 +372,36 @@ public class ChatSession implements ChatCommands {
         }
     }
 
-    private void submit(Runnable task) {
-        if (executor.isShutdown()) return;
+    private synchronized void requestRebuild() {
+        if (requestToken.get() != null) {
+            pendingRebuild.set(true);
+        } else {
+            try {
+                llmService.rebuildModel();
+            } catch (Exception e) {
+                log.error("Failed to rebuild model synchronously", e);
+                dispatcher.notice("Failed to rebuild model: " + e.getMessage(), NoticeLevel.ERROR);
+            }
+        }
+    }
+
+    private synchronized void applyDeferredRebuild() {
+        if (pendingRebuild.compareAndSet(true, false)) {
+            try {
+                llmService.rebuildModel();
+                log.info("Applied deferred model rebuild.");
+            } catch (Exception e) {
+                log.error("Failed to apply deferred model rebuild", e);
+            }
+        }
+    }
+
+    private void submit(ExecutorService pool, Runnable task) {
+        if (pool.isShutdown()) return;
         try {
-            executor.submit(task);
+            pool.submit(task);
         } catch (RejectedExecutionException e) {
-            log.warn("Task rejected — executor is shutting down");
+            log.warn("Task rejected — {} is shutting down", pool == chatWorker ? "chatWorker" : "metaWorker");
         }
     }
 }
