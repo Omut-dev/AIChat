@@ -13,7 +13,6 @@ import java.util.IdentityHashMap;
 import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.TimeoutException;
-import java.util.regex.Pattern;
 
 /**
  * Turns transport and provider exceptions into short messages
@@ -50,13 +49,6 @@ public final class ErrorMessages {
             "SSL error connecting to the server. Check the URL and certificates.";
     private static final String SERVER_ERROR =
             "Ollama returned a server error. Check the ollama serve logs.";
-
-    private static final Pattern HTTP_SERVER_ERROR = Pattern.compile(
-            "\\b(?:HTTP(?:/\\d(?:\\.\\d)?)?\\s+|HTTP\\s+status\\s+(?:code\\s+)?)"
-                    + "(?:500|502|503)\\b|"
-                    + "\\bstatus(?:\\s+code)?\\s*[:=]?\\s*(?:500|502|503)\\b",
-            Pattern.CASE_INSENSITIVE
-    );
 
     private ErrorMessages() {}
 
@@ -169,7 +161,7 @@ public final class ErrorMessages {
             return SSL_ERROR;
         }
 
-        if (HTTP_SERVER_ERROR.matcher(msg).find()) {
+        if (containsHttpServerError(msg)) {
             return SERVER_ERROR;
         }
 
@@ -179,6 +171,31 @@ public final class ErrorMessages {
 
         String fallback = deepest.getMessage();
         return fallback != null ? fallback : deepest.getClass().getSimpleName();
+    }
+
+    private static boolean containsHttpServerError(String message) {
+        return containsAny(message,
+                "http 500",
+                "http 502",
+                "http 503",
+                "http/1.0 500",
+                "http/1.0 502",
+                "http/1.0 503",
+                "http/1.1 500",
+                "http/1.1 502",
+                "http/1.1 503",
+                "http status 500",
+                "http status 502",
+                "http status 503",
+                "status 500",
+                "status 502",
+                "status 503",
+                "status: 500",
+                "status: 502",
+                "status: 503",
+                "status code 500",
+                "status code 502",
+                "status code 503");
     }
 
     private static boolean containsAny(String message, String... phrases) {
