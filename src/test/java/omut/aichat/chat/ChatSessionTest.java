@@ -247,6 +247,25 @@ class ChatSessionTest {
                     .containsExactly("first", "first");
             verify(llm, times(1)).askStreaming(any(), any());
         }
+
+        @Test
+        @DisplayName("Exception thrown by the LLM service is logged and added to history")
+        void thrownException() {
+            doThrow(new RuntimeException("out of memory"))
+                    .when(llm).askStreaming(any(), any());
+
+            session.send("hello");
+            awaitIdle();
+
+            List<AIChatMessage> history = session.getHistory();
+
+            assertThat(history).hasSize(2);
+            assertThat(history.get(1).role()).isEqualTo(AIChatMessage.Role.SYSTEM);
+            assertThat(history.get(1).text())
+                    .isEqualTo("Not enough RAM to load the model. Try a smaller model (e.g. gemma2:2b) or close other apps.");
+
+            assertThat(listener.events).contains("thinkingStarted", "thinkingFinished");
+        }
     }
 
     @Nested

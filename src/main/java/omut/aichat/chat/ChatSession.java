@@ -104,6 +104,7 @@ public class ChatSession implements ChatCommands {
                     });
 
                 } catch (Exception e) {
+                    log.error("LLM error", e);
                     if (requestToken.get() != token) return;
                     AIChatMessage error = AIChatMessage.system(ErrorMessages.humanize(e));
                     editor.append(error);
