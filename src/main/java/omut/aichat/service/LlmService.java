@@ -6,23 +6,26 @@ import omut.aichat.chat.StreamingCallback;
 import java.util.List;
 
 public interface LlmService {
+
     boolean isAvailable();
+
     List<String> listModels();
+
     void switchModel(String modelName);
+
     String currentModel();
-    /**
-     * Sets the URL of the <i>active</i> Ollama server and persists it
-     * through {@link omut.aichat.config.AppConfig}. Other servers are
-     * untouched. Blank input resets the active server's host/port to
-     * bundled defaults.
-     * <p>
-     * Does not rebuild the streaming model. Call
-     * {@link #rebuildModel()} once all settings that feed into the
-     * model — base URL, temperature, request timeout — have been
-     * updated, so the next request uses the new values.
-     */
-    void setBaseUrl(String baseUrl);
+
     void askStreaming(List<AIChatMessage> conversation, StreamingCallback callback);
+
+    /**
+     * Cancels the active streaming request, if any.
+     * <p>
+     * Implementations that support transport-level cancellation should
+     * override this method.
+     */
+    default void cancelCurrentRequest() {
+    }
+
     /**
      * Rebuilds the underlying streaming model from the current
      * configuration. Call after changing any setting that feeds into

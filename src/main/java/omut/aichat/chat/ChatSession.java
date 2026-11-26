@@ -253,6 +253,8 @@ public class ChatSession implements ChatCommands {
     }
 
     public void shutdown() {
+        cancelLlmRequest();
+
         chatWorker.shutdownNow();
         metaWorker.shutdownNow();
         try {
@@ -272,6 +274,8 @@ public class ChatSession implements ChatCommands {
         if (token == null) return;
 
         if (!requestToken.compareAndSet(token, null)) return;
+
+        cancelLlmRequest();
 
         Future<?> request = currentRequest.getAndSet(null);
         if (request != null && !request.isDone()) {
@@ -403,6 +407,14 @@ public class ChatSession implements ChatCommands {
             pool.submit(task);
         } catch (RejectedExecutionException e) {
             log.warn("Task rejected — {} is shutting down", pool == chatWorker ? "chatWorker" : "metaWorker");
+        }
+    }
+
+    private void cancelLlmRequest() {
+        try {
+            llmService.cancelCurrentRequest();
+        } catch (RuntimeException e) {
+            log.warn("Failed to cancel active LLM streaming request", e);
         }
     }
 }
