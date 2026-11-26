@@ -189,8 +189,13 @@ public class ChatSession implements ChatCommands {
 
     public void loadModels() {
         submit(metaWorker, () -> {
-            List<String> models = llmService.listModels();
-            dispatcher.modelsLoaded(models);
+            try {
+                List<String> models = llmService.listModels();
+                dispatcher.modelsLoaded(models);
+            } catch (Exception e) {
+                log.warn("Failed to load models", e);
+                dispatcher.modelsLoaded(List.of());
+            }
         });
     }
 
