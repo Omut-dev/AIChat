@@ -38,10 +38,6 @@ import static org.mockito.Mockito.*;
 
 class OllamaLlmServiceTest {
 
-    /**
-     * Minimal stub HTTP server: for a given path, returns a fixed status + body.
-     * Enough for OllamaLlmService which only does GET /api/tags.
-     */
     private static final class StubHttpServer implements AutoCloseable {
         private final ServerSocket serverSocket;
         private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
@@ -67,12 +63,12 @@ class OllamaLlmServiceTest {
             return "http://127.0.0.1:" + port();
         }
 
-        void route(String path, int status, String body) {
-            routes.put(path, new Response(status, body));
+        void route(int status, String body) {
+            routes.put("/api/tags", new Response(status, body));
         }
 
-        void route(String path, int status) {
-            route(path, status, "");
+        void route(int status) {
+            route(status, "");
         }
 
         private void acceptLoop() {
@@ -80,10 +76,7 @@ class OllamaLlmServiceTest {
                 try {
                     Socket socket = serverSocket.accept();
                     executor.submit(() -> handle(socket));
-                } catch (IOException e) {
-                    if (running) {
-                        // unexpected, but don't kill the loop
-                    }
+                } catch (IOException _) {
                 }
             }
         }
@@ -96,14 +89,8 @@ class OllamaLlmServiceTest {
                 if (requestLine == null) {
                     return;
                 }
-                // Drain headers
-                String line;
-                while ((line = reader.readLine()) != null && !line.isEmpty()) {
-                    // ignore
-                }
 
                 String path = requestLine.split(" ")[1];
-                // strip query string if any
                 int q = path.indexOf('?');
                 if (q >= 0) {
                     path = path.substring(0, q);
@@ -128,7 +115,6 @@ class OllamaLlmServiceTest {
                 out.write(bodyBytes);
                 out.flush();
             } catch (IOException ignored) {
-                // client disconnected
             }
         }
 
@@ -147,7 +133,6 @@ class OllamaLlmServiceTest {
             try {
                 serverSocket.close();
             } catch (IOException ignored) {
-                // ignore
             }
             executor.shutdownNow();
         }
@@ -225,7 +210,7 @@ class OllamaLlmServiceTest {
         @Test
         @DisplayName("Parses model names from /api/tags response")
         void parsesNames() {
-            server.route("/api/tags", 200, """
+            server.route(200, """
                     {
                       "models": [
                         {"name": "qwen2.5:7b"},
@@ -244,7 +229,7 @@ class OllamaLlmServiceTest {
         @Test
         @DisplayName("Returns empty list when models array is empty")
         void emptyModels() {
-            server.route("/api/tags", 200, "{\"models\":[]}");
+            server.route(200, "{\"models\":[]}");
 
             OllamaLlmService service = new OllamaLlmService(config, "qwen2.5:7b");
 
@@ -263,7 +248,7 @@ class OllamaLlmServiceTest {
         @Test
         @DisplayName("Returns empty list on malformed JSON")
         void malformedJson() {
-            server.route("/api/tags", 200, "not json");
+            server.route(200, "not json");
 
             OllamaLlmService service = new OllamaLlmService(config, "qwen2.5:7b");
 
@@ -369,7 +354,7 @@ class OllamaLlmServiceTest {
                 return null;
             }).when(model).chat(anyList(), any());
 
-            return new OllamaLlmService(config, "qwen2.5:7b", name -> model);
+            return new OllamaLlmService(config, "qwen2.5:7b", _ -> model);
         }
 
         private OllamaLlmService serviceWithError(Throwable error) {
@@ -381,7 +366,7 @@ class OllamaLlmServiceTest {
                 return null;
             }).when(model).chat(anyList(), any());
 
-            return new OllamaLlmService(config, "qwen2.5:7b", name -> model);
+            return new OllamaLlmService(config, "qwen2.5:7b", _ -> model);
         }
 
         @Test
@@ -456,6 +441,115 @@ class OllamaLlmServiceTest {
             assertThat(captured.get()).hasMessage("boom");
         }
 
+        @Test
+        @DisplayName("Rejects a second concurrent request")
+        void rejectsSecondRequest() throws Exception {
+            StreamingChatModel hangingModel = mock(StreamingChatModel.class);
+
+            CountDownLatch unblock = new CountDownLatch(1);
+            CountDownLatch modelEntered = new CountDownLatch(1);
+
+            doAnswer(inv -> {
+                modelEntered.countDown();
+                if (!unblock.await(5, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("Тест не разблокировал мок вовремя");
+                }
+                StreamingChatResponseHandler handler = inv.getArgument(1);
+                handler.onError(new RuntimeException("Cancelled"));
+                return null;
+            }).when(hangingModel).chat(anyList(), any());
+
+            OllamaLlmService service = new OllamaLlmService(config, "qwen2.5:7b", _ -> hangingModel);
+
+            Thread firstRequest = new Thread(() -> service.askStreaming(List.of(AIChatMessage.user("hi")), new StreamingCallback() {
+                @Override public void onToken(String chunk, String fullText) {}
+                @Override public void onComplete(LlmResponse response) {}
+                @Override public void onError(Throwable error) {}
+            }));
+            firstRequest.start();
+
+            assertThat(modelEntered.await(5, TimeUnit.SECONDS)).isTrue();
+
+            AtomicReference<Throwable> error = new AtomicReference<>();
+            CountDownLatch latch = new CountDownLatch(1);
+            service.askStreaming(List.of(AIChatMessage.user("hi")), new StreamingCallback() {
+                @Override public void onToken(String chunk, String fullText) {}
+                @Override public void onComplete(LlmResponse response) {}
+                @Override public void onError(Throwable e) {
+                    error.set(e);
+                    latch.countDown();
+                }
+            });
+
+            assertThat(latch.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(error.get()).isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("Another streaming request is already active");
+
+            service.cancelCurrentRequest();
+            unblock.countDown();
+            firstRequest.join(5000);
+        }
+
+        @Test
+        @DisplayName("Cancellation before handle is set does not throw")
+        void cancelBeforeHandle() throws Exception {
+            StreamingChatModel model = mock(StreamingChatModel.class);
+            CountDownLatch entered = new CountDownLatch(1);
+
+            doAnswer(_ -> {
+                entered.countDown();
+                return null;
+            }).when(model).chat(anyList(), any());
+
+            OllamaLlmService service = new OllamaLlmService(config, "qwen2.5:7b", _ -> model);
+
+            Thread requestThread = new Thread(() -> service.askStreaming(
+                    List.of(AIChatMessage.user("hi")),
+                    new StreamingCallback() {
+                        @Override public void onToken(String chunk, String fullText) {}
+                        @Override public void onComplete(LlmResponse response) {}
+                        @Override public void onError(Throwable error) {}
+                    }
+            ));
+            requestThread.start();
+
+            assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+
+            service.cancelCurrentRequest();
+
+            requestThread.interrupt();
+        }
+
+        @Test
+        @DisplayName("Converts ASSISTANT and SYSTEM messages correctly")
+        void convertsAllRoles() {
+            StreamingChatModel model = mock(StreamingChatModel.class);
+            doAnswer(inv -> {
+                StreamingChatResponseHandler handler = inv.getArgument(1);
+                handler.onCompleteResponse(ChatResponse.builder()
+                        .aiMessage(AiMessage.from("ok"))
+                        .build());
+                return null;
+            }).when(model).chat(anyList(), any());
+
+            OllamaLlmService service = new OllamaLlmService(config, "qwen2.5:7b", _ -> model);
+
+            List<AIChatMessage> history = List.of(
+                    AIChatMessage.system("You are helpful"),
+                    AIChatMessage.user("hi"),
+                    AIChatMessage.assistant("hello", 100, "model")
+            );
+
+            CountDownLatch latch = new CountDownLatch(1);
+            service.askStreaming(history, new StreamingCallback() {
+                @Override public void onToken(String chunk, String fullText) {}
+                @Override public void onComplete(LlmResponse response) { latch.countDown(); }
+                @Override public void onError(Throwable error) { latch.countDown(); }
+            });
+
+            assertThat(await(latch)).isTrue();
+        }
+
         private boolean await(CountDownLatch latch) {
             try {
                 return latch.await(5, TimeUnit.SECONDS);
@@ -467,6 +561,6 @@ class OllamaLlmServiceTest {
     }
 
     private void respondWith(int status) {
-        server.route("/api/tags", status);
+        server.route(status);
     }
 }

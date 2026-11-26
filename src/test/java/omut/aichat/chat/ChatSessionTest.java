@@ -3,10 +3,7 @@ package omut.aichat.chat;
 import omut.aichat.config.AppConfig;
 import omut.aichat.config.AppSettings;
 import omut.aichat.service.LlmService;
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.DisplayName;
-import org.junit.jupiter.api.Nested;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.*;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -15,7 +12,9 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.*;
 
 class ChatSessionTest {
@@ -45,10 +44,13 @@ class ChatSessionTest {
         session.addListener(listener);
     }
 
-    /**
-     * Wires LlmService.askStreaming to complete synchronously with the
-     * given response. Idempotent — safe to call before every test.
-     */
+    @AfterEach
+    void tearDown() {
+        if (session != null) {
+            session.shutdown();
+        }
+    }
+
     private void completeImmediately(String reply, long durationMillis) {
         doAnswer(inv -> {
             StreamingCallback cb = inv.getArgument(1);
@@ -65,7 +67,6 @@ class ChatSessionTest {
         }).when(llm).askStreaming(any(), any());
     }
 
-    /** Waits until the worker thread has finished both callbacks. */
     private void awaitIdle() {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
         while (System.nanoTime() < deadline) {
@@ -79,13 +80,6 @@ class ChatSessionTest {
         throw new AssertionError("worker did not finish in time: " + listener.events);
     }
 
-    /**
-     * Waits until the listener has recorded the named event, up to 2s.
-     * Replaces Thread.sleep in tests that just need to know "the
-     * worker has delivered this signal". Fails with a clear message
-     * listing what was actually seen, so a broken dispatch shows up
-     * as a diagnostic, not as a mysterious timeout.
-     */
     private void awaitEvent(String name) {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
         while (System.nanoTime() < deadline) {
@@ -131,9 +125,7 @@ class ChatSessionTest {
     @Nested
     @DisplayName("Constructor")
     class Init {
-
         @Test
-        @DisplayName("Empty history when system prompt is blank")
         void noPrompt() {
             when(config.systemPrompt()).thenReturn("");
             ChatSession s = new ChatSession(llm, config);
@@ -141,7 +133,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("System message is prepended when prompt is non-blank")
         void withPrompt() {
             when(config.systemPrompt()).thenReturn("be concise");
             ChatSession s = new ChatSession(llm, config);
@@ -156,9 +147,7 @@ class ChatSessionTest {
     @Nested
     @DisplayName("checkAvailability")
     class Availability {
-
         @Test
-        @DisplayName("Emits status(true) when the service is up")
         void available() {
             when(llm.isAvailable()).thenReturn(true);
             session.checkAvailability();
@@ -167,7 +156,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Emits status(false) when the service is down")
         void unavailable() {
             when(llm.isAvailable()).thenReturn(false);
             session.checkAvailability();
@@ -177,11 +165,30 @@ class ChatSessionTest {
     }
 
     @Nested
+    @DisplayName("loadModels")
+    class LoadModels {
+        @Test
+        void happy() {
+            when(llm.listModels()).thenReturn(List.of("a", "b"));
+            session.loadModels();
+            awaitEvent("modelsLoaded");
+            verify(llm).listModels();
+        }
+
+        @Test
+        void exceptionIsSwallowed() {
+            when(llm.listModels()).thenThrow(new RuntimeException("boom"));
+            session.loadModels();
+            awaitEvent("modelsLoaded");
+            assertThat(listener.events).contains("modelsLoaded");
+        }
+    }
+
+    @Nested
     @DisplayName("send")
     class Send {
 
         @Test
-        @DisplayName("Happy path appends user then assistant, emits thinking events")
         void happy() {
             completeImmediately("hello back", 100L);
             session.send("hello");
@@ -199,7 +206,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Blank text is ignored")
         void blank() {
             session.send("   ");
             session.send("");
@@ -209,7 +215,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Error from the model lands in history as SYSTEM")
         void error() {
             failImmediately(new java.net.ConnectException("refused"));
             session.send("hello");
@@ -223,7 +228,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Second send while a request is in flight is a no-op")
         void secondSendRejected() throws Exception {
             CountDownLatch blocker = new CountDownLatch(1);
             CountDownLatch entered = new CountDownLatch(1);
@@ -249,7 +253,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Exception thrown by the LLM service is logged and added to history")
         void thrownException() {
             doThrow(new RuntimeException("out of memory"))
                     .when(llm).askStreaming(any(), any());
@@ -266,6 +269,13 @@ class ChatSessionTest {
 
             assertThat(listener.events).contains("thinkingStarted", "thinkingFinished");
         }
+
+        @Test
+        void shutdownRejectsSend() {
+            session.shutdown();
+            session.send("hi");
+            verify(llm, never()).askStreaming(any(), any());
+        }
     }
 
     @Nested
@@ -273,7 +283,6 @@ class ChatSessionTest {
     class Cancel {
 
         @Test
-        @DisplayName("Appends cancel note, emits requestCancelled, clears token")
         void cancel() throws Exception {
             CountDownLatch blocker = new CountDownLatch(1);
             CountDownLatch entered = new CountDownLatch(1);
@@ -303,11 +312,40 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("No-op when nothing is in flight")
         void noop() {
             session.cancelCurrentRequest();
             assertThat(listener.events).doesNotContain("requestCancelled");
             assertThat(session.getHistory()).isEmpty();
+        }
+
+        @Test
+        void cancelAfterShutdownIsNoop() {
+            session.shutdown();
+            session.cancelCurrentRequest();
+            assertThat(listener.events).doesNotContain("requestCancelled");
+        }
+
+        @Test
+        void cancelTwiceOnlyEmitsOnce() throws Exception {
+            CountDownLatch blocker = new CountDownLatch(1);
+            CountDownLatch entered = new CountDownLatch(1);
+            doAnswer(_ -> {
+                entered.countDown();
+                assertTrue(blocker.await(5, TimeUnit.SECONDS), "Timed out waiting for blocker");
+                return null;
+            }).when(llm).askStreaming(any(), any());
+
+            session.send("hi");
+            assertThat(entered.await(2, TimeUnit.SECONDS)).isTrue();
+
+            session.cancelCurrentRequest();
+            session.cancelCurrentRequest();
+
+            awaitEvent("requestCancelled");
+            long count = listener.events.stream()
+                    .filter("requestCancelled"::equals)
+                    .count();
+            assertThat(count).isEqualTo(1);
         }
     }
 
@@ -316,7 +354,6 @@ class ChatSessionTest {
     class Regenerate {
 
         @Test
-        @DisplayName("Cuts the trailing assistant and re-runs the last user")
         void rerun() {
             completeImmediately("first answer", 50L);
             session.send("q");
@@ -333,12 +370,39 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Emits a notice when there is no USER message")
         void nothing() {
             session.regenerateLast();
             awaitEvent("notice:INFO");
             assertThat(listener.lastNotice.get()).isEqualTo("Nothing to regenerate.");
             assertThat(listener.lastNoticeLevel.get()).isEqualTo(NoticeLevel.INFO);
+            verify(llm, never()).askStreaming(any(), any());
+        }
+
+        @Test
+        void noopWhenGenerating() throws Exception {
+            CountDownLatch blocker = new CountDownLatch(1);
+            CountDownLatch entered = new CountDownLatch(1);
+            doAnswer(_ -> {
+                entered.countDown();
+                if (!blocker.await(5, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("test did not release the worker in time");
+                }
+                return null;
+            }).when(llm).askStreaming(any(), any());
+
+            session.send("q");
+            assertThat(entered.await(2, TimeUnit.SECONDS)).isTrue();
+            session.regenerateLast();
+
+            assertThat(listener.events).doesNotContain("historyChanged");
+
+            blocker.countDown();
+        }
+
+        @Test
+        void noopAfterShutdown() {
+            session.shutdown();
+            session.regenerateLast();
             verify(llm, never()).askStreaming(any(), any());
         }
     }
@@ -348,7 +412,6 @@ class ChatSessionTest {
     class Edit {
 
         @Test
-        @DisplayName("Replaces the last USER and re-runs the request")
         void edit() {
             completeImmediately("a1", 10L);
             session.send("original");
@@ -368,7 +431,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Unknown id is a no-op")
         void unknown() {
             session.editUserMessage("nope", "text");
             assertThat(session.getHistory()).isEmpty();
@@ -376,7 +438,15 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("During an active request emits an INFO notice, does not edit")
+        void blankArguments() {
+            session.editUserMessage(null, "text");
+            session.editUserMessage("", "text");
+            session.editUserMessage("id", null);
+            session.editUserMessage("id", "  ");
+            assertThat(session.getHistory()).isEmpty();
+        }
+
+        @Test
         void blockedWhileGenerating() throws Exception {
             CountDownLatch blocker = new CountDownLatch(1);
             CountDownLatch entered = new CountDownLatch(1);
@@ -404,6 +474,22 @@ class ChatSessionTest {
             awaitIdle();
             assertThat(session.getHistory().getFirst().text()).isEqualTo("original");
         }
+
+        @Test
+        void notAUserMessage() {
+            when(config.systemPrompt()).thenReturn("prompt");
+            ChatSession s = new ChatSession(llm, config);
+            String sysId = s.getHistory().getFirst().id();
+            s.editUserMessage(sysId, "new");
+            assertThat(s.getHistory().getFirst().text()).isEqualTo("prompt");
+        }
+
+        @Test
+        void afterShutdown() {
+            session.shutdown();
+            session.editUserMessage("id", "text");
+            verify(llm, never()).askStreaming(any(), any());
+        }
     }
 
     @Nested
@@ -411,7 +497,6 @@ class ChatSessionTest {
     class Delete {
 
         @Test
-        @DisplayName("Truncates the transcript from the given id")
         void truncate() {
             completeImmediately("a1", 10L);
             session.send("q1");
@@ -430,7 +515,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Refuses to delete a SYSTEM message")
         void refusesSystem() {
             when(config.systemPrompt()).thenReturn("prompt");
             ChatSession s = new ChatSession(llm, config);
@@ -440,7 +524,20 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("During an active request emits an INFO notice, does not truncate")
+        void blankArguments() {
+            session.deleteFrom(null);
+            session.deleteFrom("");
+            session.deleteFrom("  ");
+            assertThat(session.getHistory()).isEmpty();
+        }
+
+        @Test
+        void unknownId() {
+            session.deleteFrom("missing");
+            assertThat(session.getHistory()).isEmpty();
+        }
+
+        @Test
         void blockedWhileGenerating() throws Exception {
             CountDownLatch blocker = new CountDownLatch(1);
             CountDownLatch entered = new CountDownLatch(1);
@@ -467,6 +564,13 @@ class ChatSessionTest {
             awaitIdle();
             assertThat(session.getHistory()).hasSize(2);
         }
+
+        @Test
+        void afterShutdown() {
+            session.shutdown();
+            session.deleteFrom("id");
+            assertThat(session.getHistory()).isEmpty();
+        }
     }
 
     @Nested
@@ -474,7 +578,6 @@ class ChatSessionTest {
     class Switch {
 
         @Test
-        @DisplayName("Delegates to llmService, persists, emits modelChanged")
         void happy() {
             session.switchModel("llama3:8b");
             awaitEvent("modelChanged:llama3:8b");
@@ -484,7 +587,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Blank name emits an ERROR notice, no delegation")
         void blank() {
             session.switchModel("   ");
             assertThat(listener.lastNoticeLevel.get()).isEqualTo(NoticeLevel.ERROR);
@@ -492,7 +594,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Exception from llmService becomes an ERROR notice")
         void exception() {
             doThrow(new RuntimeException("boom")).when(llm).switchModel("bad");
             session.switchModel("bad");
@@ -507,7 +608,6 @@ class ChatSessionTest {
     class ApplySettings {
 
         @Test
-        @DisplayName("Persists every field, rebuilds model, emits notice")
         void apply() {
             AppSettings s = new AppSettings(
                     "http://192.168.1.5:11434", 1.2, 10, 30, 50_000);
@@ -524,7 +624,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Null is a no-op")
         void nullSettings() {
             session.applySettings(null);
             verify(llm, never()).rebuildModel();
@@ -536,7 +635,6 @@ class ChatSessionTest {
     class SetPrompt {
 
         @Test
-        @DisplayName("Prepends a SYSTEM message when none exists")
         void prepend() {
             when(config.systemPrompt()).thenReturn("new prompt");
             session.setSystemPrompt("new prompt");
@@ -549,7 +647,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Emits historyChanged after updating the prompt")
         void emitsHistoryChanged() {
             when(config.systemPrompt()).thenReturn("new");
 
@@ -560,7 +657,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Replaces the existing SYSTEM message in place")
         void replace() {
             when(config.systemPrompt()).thenReturn("old");
             ChatSession s = new ChatSession(llm, config);
@@ -575,7 +671,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Blank prompt removes the SYSTEM message")
         void remove() {
             when(config.systemPrompt()).thenReturn("initial");
             ChatSession s = new ChatSession(llm, config);
@@ -586,6 +681,16 @@ class ChatSessionTest {
 
             assertThat(s.getHistory()).isEmpty();
         }
+
+        @Test
+        void exceptionFromConfig() {
+            doThrow(new RuntimeException("boom"))
+                    .when(config).setSystemPrompt(anyString());
+            session.setSystemPrompt("new");
+            awaitEvent("notice:ERROR");
+            assertThat(listener.lastNoticeLevel.get()).isEqualTo(NoticeLevel.ERROR);
+            assertThat(listener.lastNotice.get()).contains("Failed to update system prompt");
+        }
     }
 
     @Nested
@@ -593,7 +698,6 @@ class ChatSessionTest {
     class Clear {
 
         @Test
-        @DisplayName("Empties history, keeps prompt, emits cleared + notice")
         void clears() {
             when(config.systemPrompt()).thenReturn("prompt");
             ChatSession s = new ChatSession(llm, config);
@@ -619,7 +723,6 @@ class ChatSessionTest {
     class Attach {
 
         @Test
-        @DisplayName("Happy path appends a SYSTEM message with content")
         void happy() {
             session.attachFile("notes.txt", "hello");
             awaitEvent("notice:SUCCESS");
@@ -634,7 +737,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Too large file emits an ERROR notice, nothing added")
         void tooLarge() {
             when(config.attachMaxChars()).thenReturn(10);
             session.attachFile("big.txt", "0123456789ABCDEF");
@@ -644,7 +746,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Empty content emits an ERROR notice, nothing added")
         void emptyContent() {
             session.attachFile("empty.txt", "   ");
             awaitEvent("notice:ERROR");
@@ -653,6 +754,14 @@ class ChatSessionTest {
             assertThat(listener.lastNoticeLevel.get()).isEqualTo(NoticeLevel.ERROR);
             assertThat(listener.lastNotice.get()).contains("empty");
         }
+
+        @Test
+        void blankFileName() {
+            session.attachFile(null, "content");
+            session.attachFile("", "content");
+            session.attachFile("  ", "content");
+            assertThat(session.getHistory()).isEmpty();
+        }
     }
 
     @Nested
@@ -660,7 +769,6 @@ class ChatSessionTest {
     class SwitchServer {
 
         @Test
-        @DisplayName("Persists active id, rebuilds model, emits notice + status")
         void happy() {
             when(config.serverName("srv-abcd1234")).thenReturn("Home");
             when(llm.isAvailable()).thenReturn(true);
@@ -678,7 +786,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Blank id is a no-op")
         void blank() {
             session.switchServer("   ");
             session.switchServer(null);
@@ -687,7 +794,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Exception from llmService.rebuildModel becomes an ERROR notice")
         void rebuildFails() {
             doThrow(new RuntimeException("boom"))
                     .when(llm).rebuildModel();
@@ -697,7 +803,7 @@ class ChatSessionTest {
 
             assertThat(listener.lastNoticeLevel.get()).isEqualTo(NoticeLevel.ERROR);
             assertThat(listener.lastNotice.get())
-                    .contains("Failed to rebuild model"); // <-- Изменили текст ожидания
+                    .contains("Failed to rebuild model");
         }
     }
 
@@ -706,7 +812,6 @@ class ChatSessionTest {
     class SwitchPrompt {
 
         @Test
-        @DisplayName("Persists active id, applies prompt text, emits notice")
         void happy() {
             when(config.promptName("prm-abcd1234")).thenReturn("Code reviewer");
             when(config.systemPrompt()).thenReturn("You are a strict reviewer");
@@ -721,7 +826,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Emits historyChanged after swapping the prompt")
         void emitsHistoryChanged() {
             when(config.promptName("prm-x")).thenReturn("X");
             when(config.systemPrompt()).thenReturn("new prompt");
@@ -733,7 +837,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Replaces the existing SYSTEM message with the new prompt's text")
         void replacesSystem() {
             when(config.systemPrompt()).thenReturn("initial prompt");
             ChatSession s = new ChatSession(llm, config);
@@ -755,7 +858,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Prepends SYSTEM when none exists, if new prompt text is non-blank")
         void prependsSystem() {
             when(config.systemPrompt()).thenReturn("");
             ChatSession s = new ChatSession(llm, config);
@@ -776,7 +878,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Removes SYSTEM when new prompt text is blank")
         void removesSystem() {
             when(config.systemPrompt()).thenReturn("initial");
             ChatSession s = new ChatSession(llm, config);
@@ -794,7 +895,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Blank id is a no-op")
         void blank() {
             session.switchPrompt("   ");
             session.switchPrompt(null);
@@ -802,7 +902,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Exception from config becomes an ERROR notice")
         void exception() {
             doThrow(new RuntimeException("boom"))
                     .when(config).setActivePrompt("prm-bad");
@@ -820,15 +919,15 @@ class ChatSessionTest {
     class Concurrency {
 
         @Test
-        @DisplayName("Deferred rebuild is applied even if streaming errors out")
         void deferredRebuildOnError() throws Exception {
             CountDownLatch streamBlocked = new CountDownLatch(1);
             CountDownLatch releaseStream = new CountDownLatch(1);
 
             doAnswer(inv -> {
                 streamBlocked.countDown();
-                boolean released = releaseStream.await(5, TimeUnit.SECONDS);
-                if (!released) throw new IllegalStateException("timeout");
+                if (!releaseStream.await(5, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("timeout");
+                }
                 StreamingCallback cb = inv.getArgument(1);
                 cb.onError(new RuntimeException("boom"));
                 return null;
@@ -837,8 +936,16 @@ class ChatSessionTest {
             session.send("hello");
             assertThat(streamBlocked.await(2, TimeUnit.SECONDS)).isTrue();
 
+            CountDownLatch modelSwitched = new CountDownLatch(1);
+
+            doAnswer(_ -> {
+                modelSwitched.countDown();
+                return null;
+            }).when(llm).switchModel("new-model");
+
             session.switchModel("new-model");
 
+            assertThat(modelSwitched.await(2, TimeUnit.SECONDS)).isTrue();
             awaitEvent("modelChanged:new-model");
 
             verify(llm, never()).rebuildModel();
@@ -850,7 +957,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Multiple rebuild requests during stream trigger only one rebuild")
         void multipleRebuildsDuringStream() throws Exception {
             CountDownLatch streamBlocked = new CountDownLatch(1);
             CountDownLatch releaseStream = new CountDownLatch(1);
@@ -883,7 +989,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("rebuildModel is called only once when cancel follows switchModel")
         void cancelAfterSwitchModelCallsRebuildOnce() throws Exception {
             CountDownLatch streamBlocked = new CountDownLatch(1);
 
@@ -905,7 +1010,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Second cancel is a no-op")
         void secondCancelIsNoop() throws Exception {
             CountDownLatch streamBlocked = new CountDownLatch(1);
 
@@ -927,7 +1031,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("loadModels completes while askStreaming is blocked")
         void loadModelsDoesNotBlockDuringStreaming() throws Exception {
             CountDownLatch streamBlocked = new CountDownLatch(1);
             CountDownLatch releaseStream = new CountDownLatch(1);
@@ -954,7 +1057,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("switchModel completes while askStreaming is blocked")
         void switchModelDoesNotBlockDuringStreaming() throws Exception {
             CountDownLatch streamBlocked = new CountDownLatch(1);
             CountDownLatch releaseStream = new CountDownLatch(1);
@@ -980,7 +1082,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("Deferred rebuildModel is applied only after streaming finishes")
         void deferredRebuildModel() throws Exception {
             CountDownLatch streamBlocked = new CountDownLatch(1);
             CountDownLatch releaseStream = new CountDownLatch(1);
@@ -1012,7 +1113,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("cancelCurrentRequest applies deferred rebuild")
         void cancelAppliesDeferredRebuild() throws Exception {
             CountDownLatch streamBlocked = new CountDownLatch(1);
 
@@ -1037,7 +1137,6 @@ class ChatSessionTest {
         }
 
         @Test
-        @DisplayName("shutdown does not hang if streaming is blocked")
         void shutdownWhileStreaming() throws Exception {
             CountDownLatch streamBlocked = new CountDownLatch(1);
 
@@ -1057,5 +1156,4 @@ class ChatSessionTest {
             assertThat(duration).isLessThan(3000);
         }
     }
-
 }
