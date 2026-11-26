@@ -8,7 +8,10 @@ import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.chat.StreamingChatModel;
 import dev.langchain4j.model.chat.response.ChatResponse;
+import dev.langchain4j.model.chat.response.PartialResponse;
+import dev.langchain4j.model.chat.response.PartialResponseContext;
 import dev.langchain4j.model.chat.response.StreamingChatResponseHandler;
+import dev.langchain4j.model.chat.response.StreamingHandle;
 import dev.langchain4j.model.ollama.OllamaStreamingChatModel;
 import omut.aichat.chat.AIChatMessage;
 import omut.aichat.chat.LlmResponse;
@@ -26,6 +29,8 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 
 public class OllamaLlmService implements LlmService {
@@ -35,6 +40,8 @@ public class OllamaLlmService implements LlmService {
 
     private final AppConfig config;
     private final Function<String, StreamingChatModel> modelFactory;
+    private final AtomicReference<StreamingRequest> activeRequest = new AtomicReference<>();
+
     private volatile String currentModel;
     private volatile StreamingChatModel streamingModel;
 
@@ -42,9 +49,14 @@ public class OllamaLlmService implements LlmService {
         this(config, initialModel, name -> buildModel(config, name));
     }
 
-    /** Package-private constructor for tests with a mock factory. */
-    OllamaLlmService(AppConfig config, String initialModel,
-                     Function<String, StreamingChatModel> modelFactory) {
+    /**
+     * Package-private constructor for tests with a mock factory.
+     */
+    OllamaLlmService(
+            AppConfig config,
+            String initialModel,
+            Function<String, StreamingChatModel> modelFactory
+    ) {
         this.config = config;
         this.modelFactory = modelFactory;
         switchModel(initialModel);
@@ -111,14 +123,101 @@ public class OllamaLlmService implements LlmService {
     }
 
     @Override
-    public void setBaseUrl(String baseUrl) {
-        config.setBaseUrl(baseUrl);
-    }
-
-    @Override
     public void rebuildModel() {
         if (currentModel != null) {
             switchModel(currentModel);
+        }
+    }
+
+    @Override
+    public void cancelCurrentRequest() {
+        StreamingRequest request = activeRequest.get();
+        if (request != null) {
+            request.cancel();
+        }
+    }
+
+    @Override
+    public void askStreaming(List<AIChatMessage> conversation, StreamingCallback callback) {
+        List<ChatMessage> messages = new ArrayList<>();
+        for (AIChatMessage msg : conversation) {
+            messages.add(toLangchainMessage(msg));
+        }
+
+        StreamingRequest request = new StreamingRequest();
+        if (!activeRequest.compareAndSet(null, request)) {
+            callback.onError(new IllegalStateException("Another streaming request is already active"));
+            return;
+        }
+
+        long start = System.nanoTime();
+        StringBuilder accumulator = new StringBuilder();
+        CountDownLatch latch = new CountDownLatch(1);
+
+        try {
+            streamingModel.chat(messages, new StreamingChatResponseHandler() {
+
+                @Override
+                public void onPartialResponse(String partialResponse) {
+                    appendAndNotify(partialResponse);
+                }
+
+                @Override
+                public void onPartialResponse(
+                        PartialResponse partialResponse,
+                        PartialResponseContext context) {
+
+                    request.setHandle(context.streamingHandle());
+                    appendAndNotify(partialResponse.text());
+                }
+
+                private void appendAndNotify(String partialResponse) {
+                    accumulator.append(partialResponse);
+                    callback.onToken(partialResponse, accumulator.toString());
+                }
+
+                @Override
+                public void onCompleteResponse(ChatResponse response) {
+                    try {
+                        long elapsedNanos = System.nanoTime() - start;
+                        int outputTokens = response.tokenUsage() != null
+                                ? response.tokenUsage().outputTokenCount()
+                                : 0;
+                        callback.onComplete(new LlmResponse(
+                                accumulator.toString(),
+                                elapsedNanos / 1_000_000,
+                                outputTokens,
+                                elapsedNanos
+                        ));
+                    } finally {
+                        latch.countDown();
+                    }
+                }
+
+                @Override
+                public void onError(Throwable error) {
+                    try {
+                        callback.onError(error);
+                    } finally {
+                        latch.countDown();
+                    }
+                }
+            });
+
+            int timeoutMinutes = config.requestTimeoutMinutes();
+            try {
+                if (!latch.await(timeoutMinutes, TimeUnit.MINUTES)) {
+                    request.cancel();
+                    callback.onError(new TimeoutException(
+                            "Streaming did not complete within " + timeoutMinutes + " minutes"));
+                }
+            } catch (InterruptedException e) {
+                request.cancel();
+                Thread.currentThread().interrupt();
+                callback.onError(e);
+            }
+        } finally {
+            activeRequest.compareAndSet(request, null);
         }
     }
 
@@ -130,69 +229,6 @@ public class OllamaLlmService implements LlmService {
         };
     }
 
-    @Override
-    public void askStreaming(List<AIChatMessage> conversation, StreamingCallback callback) {
-        List<ChatMessage> messages = new ArrayList<>();
-        for (AIChatMessage msg : conversation) {
-            messages.add(toLangchainMessage(msg));
-        }
-
-        long start = System.nanoTime();
-        StringBuilder accumulator = new StringBuilder();
-        CountDownLatch latch = new CountDownLatch(1);
-
-        streamingModel.chat(messages, new StreamingChatResponseHandler() {
-
-            @Override
-            public void onPartialResponse(String partialResponse) {
-                accumulator.append(partialResponse);
-                callback.onToken(partialResponse, accumulator.toString());
-            }
-
-            @Override
-            public void onCompleteResponse(ChatResponse response) {
-                try {
-                    long elapsedNanos = System.nanoTime() - start;
-                    int outputTokens = response.tokenUsage() != null
-                            ? response.tokenUsage().outputTokenCount()
-                            : 0;
-                    callback.onComplete(new LlmResponse(
-                            accumulator.toString(),
-                            elapsedNanos / 1_000_000,
-                            outputTokens,
-                            elapsedNanos
-                    ));
-                } finally {
-                    latch.countDown();
-                }
-            }
-
-            @Override
-            public void onError(Throwable error) {
-                try {
-                    callback.onError(error);
-                } finally {
-                    latch.countDown();
-                }
-            }
-        });
-
-        int timeoutMinutes = config.requestTimeoutMinutes();
-        try {
-            if (!latch.await(timeoutMinutes, TimeUnit.MINUTES)) {
-                callback.onError(new TimeoutException(
-                        "Streaming did not complete within " + timeoutMinutes + " minutes"));
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            callback.onError(e);
-        }
-    }
-
-    /**
-     * Opens a connection to Ollama's /api/tags endpoint.
-     * Caller is responsible for disconnecting.
-     */
     private HttpURLConnection openTagsConnection(int timeoutMillis) throws IOException {
         HttpURLConnection connection = (HttpURLConnection)
                 URI.create(config.getBaseUrl() + "/api/tags").toURL().openConnection();
@@ -200,5 +236,36 @@ public class OllamaLlmService implements LlmService {
         connection.setConnectTimeout(timeoutMillis);
         connection.setReadTimeout(timeoutMillis);
         return connection;
+    }
+
+    private static class StreamingRequest {
+
+        private final AtomicReference<StreamingHandle> handle = new AtomicReference<>();
+        private final AtomicBoolean cancelled = new AtomicBoolean(false);
+
+        private void setHandle(StreamingHandle streamingHandle) {
+            handle.set(streamingHandle);
+
+            if (cancelled.get()) {
+                cancelHandle(streamingHandle);
+            }
+        }
+
+        private void cancel() {
+            cancelled.set(true);
+
+            StreamingHandle streamingHandle = handle.get();
+            if (streamingHandle != null) {
+                cancelHandle(streamingHandle);
+            }
+        }
+
+        private void cancelHandle(StreamingHandle streamingHandle) {
+            try {
+                streamingHandle.cancel();
+            } catch (RuntimeException e) {
+                log.warn("Failed to cancel Ollama streaming request", e);
+            }
+        }
     }
 }
