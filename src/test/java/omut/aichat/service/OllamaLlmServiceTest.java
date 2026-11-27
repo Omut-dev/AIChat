@@ -8,6 +8,7 @@ import omut.aichat.chat.AIChatMessage;
 import omut.aichat.chat.LlmResponse;
 import omut.aichat.chat.StreamingCallback;
 import omut.aichat.config.AppConfig;
+import org.jspecify.annotations.NonNull;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -521,6 +522,46 @@ class OllamaLlmServiceTest {
         }
 
         @Test
+        @DisplayName("Does not deliver tokens after cancellation")
+        void doesNotDeliverTokensAfterCancellation() throws Exception {
+            StreamingChatModel model = mock(StreamingChatModel.class);
+            AtomicReference<StreamingChatResponseHandler> handlerRef = new AtomicReference<>();
+            CountDownLatch modelEntered = new CountDownLatch(1);
+            CountDownLatch releaseRequest = new CountDownLatch(1);
+
+            doAnswer(inv -> {
+                handlerRef.set(inv.getArgument(1));
+                modelEntered.countDown();
+                assertThat(releaseRequest.await(5, TimeUnit.SECONDS)).isTrue();
+                return null;
+            }).when(model).chat(anyList(), any());
+
+            OllamaLlmService service = new OllamaLlmService(config, "qwen2.5:7b", _ -> model);
+            List<String> receivedTokens = new CopyOnWriteArrayList<>();
+
+            Thread requestThread = createRequestThread(service, receivedTokens);
+
+            assertThat(modelEntered.await(5, TimeUnit.SECONDS)).isTrue();
+
+            service.cancelCurrentRequest();
+            releaseRequest.countDown();
+
+            service.cancelCurrentRequest();
+            releaseRequest.countDown();
+
+            StreamingChatResponseHandler handler = handlerRef.get();
+            assertThat(handler).isNotNull();
+
+            handler.onPartialResponse("late token");
+            handler.onError(new RuntimeException("cancelled"));
+
+            requestThread.join(5000);
+
+            assertThat(requestThread.isAlive()).isFalse();
+            assertThat(receivedTokens).isEmpty();
+        }
+
+        @Test
         @DisplayName("Converts ASSISTANT and SYSTEM messages correctly")
         void convertsAllRoles() {
             StreamingChatModel model = mock(StreamingChatModel.class);
@@ -548,6 +589,27 @@ class OllamaLlmServiceTest {
             });
 
             assertThat(await(latch)).isTrue();
+        }
+
+        private static @NonNull Thread createRequestThread(OllamaLlmService service, List<String> receivedTokens) {
+            Thread requestThread = new Thread(() -> service.askStreaming(
+                    List.of(AIChatMessage.user("hi")),
+                    new StreamingCallback() {
+                        @Override
+                        public void onToken(String chunk, String fullText) {
+                            receivedTokens.add(chunk);
+                        }
+
+                        @Override
+                        public void onComplete(LlmResponse response) {}
+
+                        @Override
+                        public void onError(Throwable error) {}
+                    }
+            ));
+
+            requestThread.start();
+            return requestThread;
         }
 
         private boolean await(CountDownLatch latch) {

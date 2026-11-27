@@ -12,12 +12,9 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
@@ -30,9 +27,10 @@ class OllamaLlmServiceCancellationIntegrationTest {
 
     @SuppressWarnings("InfiniteLoopStatement")
     @Test
-    void cancelCurrentRequestShouldCloseHttpConnection() throws Exception {
-        CountDownLatch tokenReceived = new CountDownLatch(1);
-        CountDownLatch clientDisconnected = new CountDownLatch(1);
+    void cancelCurrentRequestShouldCloseHttpConnectionTenTimes() throws Exception {
+        int cancellationCount = 10;
+
+        Semaphore clientDisconnects = new Semaphore(0);
 
         ExecutorService serverExecutor = Executors.newCachedThreadPool();
         ExecutorService requestExecutor = Executors.newSingleThreadExecutor();
@@ -45,8 +43,8 @@ class OllamaLlmServiceCancellationIntegrationTest {
         server.setExecutor(serverExecutor);
 
         String responseChunk = """
-                {"model":"test-model","created_at":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":"%s"},"done":false}
-                """.formatted("x".repeat(8192));
+            {"model":"test-model","created_at":"2026-01-01T00:00:00Z","message":{"role":"assistant","content":"%s"},"done":false}
+            """.formatted("x".repeat(8192));
 
         byte[] responseBytes = responseChunk.getBytes(StandardCharsets.UTF_8);
 
@@ -57,7 +55,6 @@ class OllamaLlmServiceCancellationIntegrationTest {
                         "application/x-ndjson"
                 );
                 exchange.sendResponseHeaders(200, 0);
-                log.info("Mock server: headers sent, starting streaming");
 
                 var output = exchange.getResponseBody();
 
@@ -67,16 +64,14 @@ class OllamaLlmServiceCancellationIntegrationTest {
                     output.flush();
                 }
             } catch (IOException e) {
-                log.info("Mock server: client disconnected (IOException)");
-                clientDisconnected.countDown();
+                log.info("Mock server: client disconnected");
+                clientDisconnects.release();
             } finally {
                 exchange.close();
-                log.info("Mock server: exchange closed");
             }
         });
 
         server.start();
-        log.info("Mock server started on port {}", server.getAddress().getPort());
 
         try {
             AppConfig config = mock(AppConfig.class);
@@ -91,41 +86,50 @@ class OllamaLlmServiceCancellationIntegrationTest {
                     config,
                     "test-model"
             );
-            log.info("Service created");
 
-            StreamingCallback callback = mock(StreamingCallback.class);
+            for (int i = 1; i <= cancellationCount; i++) {
+                CountDownLatch tokenReceived = new CountDownLatch(1);
 
-            doAnswer(_ -> {
-                log.info("Client received first token");
-                tokenReceived.countDown();
-                return null;
-            }).when(callback).onToken(anyString(), anyString());
+                StreamingCallback callback = mock(StreamingCallback.class);
 
-            Future<?> request = requestExecutor.submit(
-                    () -> service.askStreaming(List.of(AIChatMessage.user("Hello")), callback)
+                doAnswer(_ -> {
+                    tokenReceived.countDown();
+                    return null;
+                }).when(callback).onToken(anyString(), anyString());
+
+                Future<?> request = requestExecutor.submit(
+                        () -> service.askStreaming(
+                                List.of(AIChatMessage.user("Hello")),
+                                callback
+                        )
+                );
+
+                assertTrue(
+                        tokenReceived.await(10, TimeUnit.SECONDS),
+                        "Request " + i + ": no streaming token received"
+                );
+
+                service.cancelCurrentRequest();
+
+                assertTrue(
+                        clientDisconnects.tryAcquire(10, TimeUnit.SECONDS),
+                        "Request " + i + ": server did not detect client disconnection"
+                );
+
+                request.get(10, TimeUnit.SECONDS);
+
+                log.info("Cancellation {}/{} completed", i, cancellationCount);
+            }
+
+            assertEquals(
+                    cancellationCount,
+                    clientDisconnects.availablePermits() + cancellationCount
             );
-            log.info("Streaming request submitted");
 
-            assertTrue(
-                    tokenReceived.await(10, TimeUnit.SECONDS),
-                    "The server did not deliver a streaming token"
-            );
-            log.info("First token confirmed, cancelling request");
-
-            service.cancelCurrentRequest();
-            request.cancel(true);
-            log.info("Cancellation requested");
-
-            assertTrue(
-                    clientDisconnected.await(10, TimeUnit.SECONDS),
-                    "The HTTP server did not detect client disconnection after cancellation"
-            );
-            log.info("Test passed: connection closed after cancellation");
         } finally {
             server.stop(0);
             requestExecutor.shutdownNow();
             serverExecutor.shutdownNow();
-            log.info("Resources cleaned up");
         }
     }
 }

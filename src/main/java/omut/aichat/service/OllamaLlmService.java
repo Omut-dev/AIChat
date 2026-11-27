@@ -144,7 +144,9 @@ public class OllamaLlmService implements LlmService {
             messages.add(toLangchainMessage(msg));
         }
 
-        StreamingRequest request = new StreamingRequest();
+        CountDownLatch latch = new CountDownLatch(1);
+        StreamingRequest request = new StreamingRequest(latch);
+
         if (!activeRequest.compareAndSet(null, request)) {
             callback.onError(new IllegalStateException("Another streaming request is already active"));
             return;
@@ -152,7 +154,6 @@ public class OllamaLlmService implements LlmService {
 
         long start = System.nanoTime();
         StringBuilder accumulator = new StringBuilder();
-        CountDownLatch latch = new CountDownLatch(1);
 
         try {
             streamingModel.chat(messages, new StreamingChatResponseHandler() {
@@ -172,6 +173,10 @@ public class OllamaLlmService implements LlmService {
                 }
 
                 private void appendAndNotify(String partialResponse) {
+                    if (request.isCancelled()) {
+                        return;
+                    }
+
                     accumulator.append(partialResponse);
                     callback.onToken(partialResponse, accumulator.toString());
                 }
@@ -242,6 +247,11 @@ public class OllamaLlmService implements LlmService {
 
         private final AtomicReference<StreamingHandle> handle = new AtomicReference<>();
         private final AtomicBoolean cancelled = new AtomicBoolean(false);
+        private final CountDownLatch completionLatch;
+
+        private StreamingRequest(CountDownLatch completionLatch) {
+            this.completionLatch = completionLatch;
+        }
 
         private void setHandle(StreamingHandle streamingHandle) {
             handle.set(streamingHandle);
@@ -258,6 +268,8 @@ public class OllamaLlmService implements LlmService {
             if (streamingHandle != null) {
                 cancelHandle(streamingHandle);
             }
+
+            completionLatch.countDown();
         }
 
         private void cancelHandle(StreamingHandle streamingHandle) {
@@ -266,6 +278,10 @@ public class OllamaLlmService implements LlmService {
             } catch (RuntimeException e) {
                 log.warn("Failed to cancel Ollama streaming request", e);
             }
+        }
+
+        private boolean isCancelled() {
+            return cancelled.get();
         }
     }
 }
