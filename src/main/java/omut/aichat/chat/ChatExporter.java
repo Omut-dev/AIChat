@@ -12,6 +12,7 @@ import omut.aichat.utils.TimeFormat;
 
 import java.awt.Color;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -131,28 +132,31 @@ public class ChatExporter {
     /** Exports the conversation to a PDF file. */
     public static void exportPdf(List<AIChatMessage> history, Path file) throws IOException {
         Document doc = new Document();
-        try {
-            PdfWriter.getInstance(doc, Files.newOutputStream(file));
-            doc.open();
 
-            Font titleFont = new Font(Font.HELVETICA, 16, Font.BOLD);
-            Font metaFont = new Font(Font.HELVETICA, 9, Font.ITALIC, new Color(120, 120, 120));
-            Font roleFont = new Font(Font.HELVETICA, 12, Font.BOLD);
-            Font bodyFont = new Font(Font.HELVETICA, 11, Font.NORMAL);
+        try (OutputStream output = Files.newOutputStream(file)) {
+            try {
+                PdfWriter.getInstance(doc, output);
+                doc.open();
 
-            doc.add(new Paragraph("AIChat conversation", titleFont));
-            doc.add(new Paragraph("Exported: " + LocalDateTime.now().format(TIMESTAMP), metaFont));
-            doc.add(new Paragraph(" "));
+                Font titleFont = new Font(Font.HELVETICA, 16, Font.BOLD);
+                Font metaFont = new Font(Font.HELVETICA, 9, Font.ITALIC, new Color(120, 120, 120));
+                Font roleFont = new Font(Font.HELVETICA, 12, Font.BOLD);
+                Font bodyFont = new Font(Font.HELVETICA, 11, Font.NORMAL);
 
-            for (AIChatMessage msg : history) {
-                doc.add(new Paragraph(roleHeader(msg), roleFont));
-                doc.add(new Paragraph(msg.text(), bodyFont));
+                doc.add(new Paragraph("AIChat conversation", titleFont));
+                doc.add(new Paragraph("Exported: " + LocalDateTime.now().format(TIMESTAMP), metaFont));
                 doc.add(new Paragraph(" "));
+
+                for (AIChatMessage msg : history) {
+                    doc.add(new Paragraph(roleHeader(msg), roleFont));
+                    doc.add(new Paragraph(msg.text(), bodyFont));
+                    doc.add(new Paragraph(" "));
+                }
+            } catch (DocumentException e) {
+                throw new IOException("Failed to write PDF", e);
+            } finally {
+                doc.close();
             }
-        } catch (DocumentException e) {
-            throw new IOException("Failed to write PDF", e);
-        } finally {
-            doc.close();
         }
     }
 
