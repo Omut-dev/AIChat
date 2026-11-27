@@ -2,6 +2,8 @@ package omut.aichat.chat;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.lowagie.text.pdf.PdfReader;
+import com.lowagie.text.pdf.parser.PdfTextExtractor;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -409,6 +411,25 @@ class ChatExporterTest {
                     AIChatMessage.assistant("hi", 0L, null)));
             assertThat(file).exists();
             assertThat(Files.size(file)).isGreaterThan(100);
+        }
+    }
+
+    @Test
+    @DisplayName("PDF is readable and contains user and assistant messages")
+    void containsConversationText() throws IOException {
+        Path file = exportPdf(List.of(
+                AIChatMessage.user("Hello from user"),
+                AIChatMessage.assistant("Hello from assistant", 0L, "qwen2.5:7b")
+        ));
+
+        try (PdfReader reader = new PdfReader(Files.readAllBytes(file))) {
+            String text = new PdfTextExtractor(reader).getTextFromPage(1);
+
+            assertThat(text)
+                    .contains("You")
+                    .contains("Hello from user")
+                    .contains("AI (qwen2.5:7b)")
+                    .contains("Hello from assistant");
         }
     }
 
