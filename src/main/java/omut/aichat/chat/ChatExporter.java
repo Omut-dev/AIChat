@@ -3,10 +3,8 @@ package omut.aichat.chat;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import com.lowagie.text.Document;
-import com.lowagie.text.DocumentException;
-import com.lowagie.text.Font;
-import com.lowagie.text.Paragraph;
+import com.lowagie.text.*;
+import com.lowagie.text.pdf.BaseFont;
 import com.lowagie.text.pdf.PdfWriter;
 import omut.aichat.utils.TimeFormat;
 
@@ -24,6 +22,22 @@ public class ChatExporter {
 
     private static final DateTimeFormatter TIMESTAMP =
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+    private static final BaseFont BASE_FONT = loadBaseFont();
+
+    private static BaseFont loadBaseFont() {
+        try (var in = ChatExporter.class.getResourceAsStream("/font/DejaVuSans.ttf")) {
+            if (in == null) {
+                throw new IllegalStateException(
+                        "Font not found on classpath: /font/DejaVuSans.ttf");
+            }
+            return BaseFont.createFont(
+                    "DejaVuSans.ttf", BaseFont.IDENTITY_H, BaseFont.EMBEDDED,
+                    true, in.readAllBytes(), null);
+        } catch (DocumentException | IOException e) {
+            throw new ExceptionInInitializerError(e);
+        }
+    }
 
     /** Exports the conversation to a Markdown file. */
     public static void exportMarkdown(List<AIChatMessage> history, Path file) throws IOException {
@@ -50,9 +64,7 @@ public class ChatExporter {
                     }
                     sb.append(msg.text()).append("\n\n");
                 }
-                case SYSTEM -> {
-                    sb.append(quoteSystem(msg.text())).append("\n\n");
-                }
+                case SYSTEM -> sb.append(quoteSystem(msg.text())).append("\n\n");
             }
         }
 
@@ -117,11 +129,9 @@ public class ChatExporter {
                         msg.model() != null && !msg.model().isBlank()
                                 ? "AI (" + msg.model() + ")" : "AI",
                         msg.text());
-                case SYSTEM -> {
-                    sb.append("<div class=\"msg system\"><div class=\"body\">")
-                            .append(escapeHtml(msg.text()))
-                            .append("</div></div>\n");
-                }
+                case SYSTEM -> sb.append("<div class=\"msg system\"><div class=\"body\">")
+                        .append(escapeHtml(msg.text()))
+                        .append("</div></div>\n");
             }
         }
 
@@ -131,33 +141,52 @@ public class ChatExporter {
 
     /** Exports the conversation to a PDF file. */
     public static void exportPdf(List<AIChatMessage> history, Path file) throws IOException {
-        Document doc = new Document();
+        try (PdfDocument pdf = new PdfDocument(file)) {
+            Font titleFont = new Font(BASE_FONT, 16, Font.BOLD);
+            Font metaFont  = new Font(BASE_FONT, 9,  Font.ITALIC, new Color(120, 120, 120));
+            Font roleFont  = new Font(BASE_FONT, 12, Font.BOLD);
+            Font bodyFont  = new Font(BASE_FONT, 11, Font.NORMAL);
+            Font sysFont   = new Font(BASE_FONT, 10, Font.ITALIC, new Color(100, 100, 100));
 
-        try (OutputStream output = Files.newOutputStream(file)) {
-            try {
-                PdfWriter.getInstance(doc, output);
-                doc.open();
+            pdf.add(new Paragraph("AIChat conversation", titleFont));
+            pdf.add(new Paragraph("Exported: " + LocalDateTime.now().format(TIMESTAMP), metaFont));
+            pdf.add(new Paragraph(" "));
 
-                Font titleFont = new Font(Font.HELVETICA, 16, Font.BOLD);
-                Font metaFont = new Font(Font.HELVETICA, 9, Font.ITALIC, new Color(120, 120, 120));
-                Font roleFont = new Font(Font.HELVETICA, 12, Font.BOLD);
-                Font bodyFont = new Font(Font.HELVETICA, 11, Font.NORMAL);
+            for (AIChatMessage msg : history) {
+                boolean system = msg.role() == AIChatMessage.Role.SYSTEM;
+                Font hdr  = system ? sysFont : roleFont;
+                Font body = system ? sysFont : bodyFont;
 
-                doc.add(new Paragraph("AIChat conversation", titleFont));
-                doc.add(new Paragraph("Exported: " + LocalDateTime.now().format(TIMESTAMP), metaFont));
-                doc.add(new Paragraph(" "));
-
-                for (AIChatMessage msg : history) {
-                    doc.add(new Paragraph(roleHeader(msg), roleFont));
-                    doc.add(new Paragraph(msg.text(), bodyFont));
-                    doc.add(new Paragraph(" "));
+                pdf.add(new Paragraph(roleHeader(msg), hdr));
+                for (String line : msg.text().split("\n", -1)) {
+                    Paragraph p = new Paragraph(line, body);
+                    p.setSpacingAfter(0f);
+                    pdf.add(p);
                 }
+                pdf.add(new Paragraph(" "));
+            }
+        } catch (DocumentException e) {
+            throw new IOException("Failed to write PDF", e);
+        }
+    }
+
+    private static final class PdfDocument implements AutoCloseable {
+        private final Document doc = new Document();
+
+        PdfDocument(Path file) throws IOException {
+            OutputStream out = Files.newOutputStream(file);
+            try {
+                PdfWriter.getInstance(doc, out);
+                doc.open();
             } catch (DocumentException e) {
+                try { out.close(); } catch (IOException ignored) { }
                 throw new IOException("Failed to write PDF", e);
-            } finally {
-                doc.close();
             }
         }
+
+        void add(Element e) throws DocumentException { doc.add(e); }
+
+        @Override public void close() { doc.close(); }
     }
 
     private static String roleHeader(AIChatMessage msg) {
