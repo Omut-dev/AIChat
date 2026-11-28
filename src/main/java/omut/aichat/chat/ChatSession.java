@@ -23,15 +23,22 @@ public class ChatSession implements ChatCommands {
     private final AppConfig config;
     private final ChatDispatcher dispatcher = new ChatDispatcher();
     private final HistoryEditor editor = new HistoryEditor();
+    private final Object requestLock = new Object();
+    private final ExecutorService chatWorker;
 
-    private final ExecutorService chatWorker = Executors.newSingleThreadExecutor(
-            r -> new Thread(r, "chat-worker"));
     private final ExecutorService metaWorker = Executors.newSingleThreadExecutor(
             r -> new Thread(r, "meta-worker"));
 
     public ChatSession(LlmService llmService, AppConfig config) {
+        this(llmService, config, Executors.newSingleThreadExecutor(
+                r -> new Thread(r, "chat-worker")));
+    }
+
+    ChatSession(LlmService llmService, AppConfig config, ExecutorService chatWorker) {
         this.llmService = llmService;
         this.config = config;
+        this.chatWorker = chatWorker;
+
         String prompt = config.systemPrompt();
         if (!prompt.isBlank()) {
             editor.append(AIChatMessage.system(prompt));
@@ -68,59 +75,83 @@ public class ChatSession implements ChatCommands {
     }
 
     private void submitStreamingRequest(Object token) {
-        try {
-            Future<?> future = chatWorker.submit(() -> {
-                long start = System.nanoTime();
-                try {
-                    List<AIChatMessage> requestHistory =
-                            RequestHistoryBuilder.trim(editor.snapshot(), config.historyMaxMessages());
-                    llmService.askStreaming(requestHistory, new StreamingCallback() {
+        FutureTask<Void> future = new FutureTask<>(() -> {
+            long start = System.nanoTime();
+            try {
+                List<AIChatMessage> requestHistory =
+                        RequestHistoryBuilder.trim(editor.snapshot(), config.historyMaxMessages());
+                llmService.askStreaming(requestHistory, new StreamingCallback() {
 
-                        @Override
-                        public void onToken(String chunk, String fullText) {
-                            if (requestToken.get() != token) return;
-                            dispatcher.token(chunk, fullText);
-                        }
+                    @Override
+                    public void onToken(String chunk, String fullText) {
+                        if (requestToken.get() != token) return;
+                        dispatcher.token(chunk, fullText);
+                    }
 
-                        @Override
-                        public void onComplete(LlmResponse response) {
-                            if (requestToken.get() != token) return;
-                            long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
-                            AIChatMessage assistantMessage = AIChatMessage.assistant(
-                                    response.text(), response.durationMillis(), currentModel());
-                            editor.append(assistantMessage);
-                            dispatcher.message(assistantMessage);
-                            dispatcher.responseTime(elapsedMillis);
-                            dispatcher.tokensPerSecond(response.tokensPerSecond());
-                        }
+                    @Override
+                    public void onComplete(LlmResponse response) {
+                        if (requestToken.get() != token) return;
+                        long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+                        AIChatMessage assistantMessage = AIChatMessage.assistant(
+                                response.text(), response.durationMillis(), currentModel());
+                        editor.append(assistantMessage);
+                        dispatcher.message(assistantMessage);
+                        dispatcher.responseTime(elapsedMillis);
+                        dispatcher.tokensPerSecond(response.tokensPerSecond());
+                    }
 
-                        @Override
-                        public void onError(Throwable error) {
-                            if (requestToken.get() != token) return;
-                            AIChatMessage errorMsg = AIChatMessage.system(ErrorMessages.humanize(error));
-                            editor.append(errorMsg);
-                            dispatcher.message(errorMsg);
-                        }
-                    });
+                    @Override
+                    public void onError(Throwable error) {
+                        if (requestToken.get() != token) return;
+                        AIChatMessage errorMsg = AIChatMessage.system(ErrorMessages.humanize(error));
+                        editor.append(errorMsg);
+                        dispatcher.message(errorMsg);
+                    }
+                });
 
-                } catch (Exception e) {
-                    log.error("LLM error", e);
-                    if (requestToken.get() != token) return;
+            } catch (Exception e) {
+                log.error("LLM error", e);
+                if (requestToken.get() == token) {
                     AIChatMessage error = AIChatMessage.system(ErrorMessages.humanize(e));
                     editor.append(error);
                     dispatcher.message(error);
-                } finally {
-                    if (requestToken.compareAndSet(token, null)) {
+                }
+            } finally {
+                boolean completed;
+                synchronized (requestLock) {
+                    completed = requestToken.compareAndSet(token, null);
+                    if (completed) {
                         currentRequest.set(null);
-                        dispatcher.thinkingFinished();
-                        applyDeferredRebuild();
                     }
                 }
-            });
+
+                if (completed) {
+                    dispatcher.thinkingFinished();
+                    applyDeferredRebuild();
+                }
+            }
+            return null;
+        });
+
+        synchronized (requestLock) {
+            if (requestToken.get() != token) return;
             currentRequest.set(future);
+        }
+
+        try {
+            chatWorker.execute(future);
         } catch (RejectedExecutionException e) {
-            requestToken.set(null);
-            dispatcher.thinkingFinished();
+            boolean rejected;
+            synchronized (requestLock) {
+                rejected = requestToken.compareAndSet(token, null);
+                if (rejected) {
+                    currentRequest.compareAndSet(future, null);
+                }
+            }
+
+            if (rejected) {
+                dispatcher.thinkingFinished();
+            }
         }
     }
 
@@ -275,16 +306,21 @@ public class ChatSession implements ChatCommands {
     }
 
     public void cancelCurrentRequest() {
-        Object token = requestToken.get();
-        if (token == null) return;
+        Future<?> request;
 
-        if (!requestToken.compareAndSet(token, null)) return;
+        synchronized (requestLock) {
+            Object token = requestToken.get();
+            if (token == null) return;
 
-        cancelLlmRequest();
+            if (!requestToken.compareAndSet(token, null)) return;
 
-        Future<?> request = currentRequest.getAndSet(null);
-        if (request != null && !request.isDone()) {
-            request.cancel(true);
+            request = currentRequest.getAndSet(null);
+
+            cancelLlmRequest();
+
+            if (request != null && !request.isDone()) {
+                request.cancel(true);
+            }
         }
 
         AIChatMessage cancelNote = AIChatMessage.system("Generation cancelled.");
