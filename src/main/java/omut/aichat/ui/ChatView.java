@@ -6,8 +6,8 @@ import javafx.application.Platform;
 import javafx.concurrent.Worker;
 import javafx.scene.Parent;
 import javafx.scene.control.Toggle;
+import javafx.stage.FileChooser;
 import omut.aichat.chat.AIChatMessage;
-import omut.aichat.chat.ChatExporter;
 import omut.aichat.chat.ChatListener;
 import omut.aichat.chat.ChatSession;
 import omut.aichat.chat.NoticeLevel;
@@ -15,7 +15,6 @@ import javafx.scene.input.Clipboard;
 import javafx.scene.input.ClipboardContent;
 import javafx.scene.input.KeyCode;
 import javafx.scene.input.KeyEvent;
-import javafx.stage.FileChooser;
 import javafx.stage.Window;
 import javafx.util.Duration;
 // Wildcard import: JSObject is deprecated since JDK 24 and IDEA
@@ -33,7 +32,6 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
-import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -53,6 +51,7 @@ public class ChatView implements ChatListener {
     private final ChatJsBridge jsBridge;
     private final ChatScripts scripts;
     private final ChatSearch search;
+    private final ChatExport chatExport;
 
     private volatile long lastStreamRenderNanos = 0;
     private boolean busy = false;
@@ -82,6 +81,13 @@ public class ChatView implements ChatListener {
                 view.searchCounter.setText((current + 1) + " of " + total);
             }
         });
+        this.chatExport = new ChatExport(
+                session,
+                this::window,
+                ChatExport::chooseSaveFile,
+                this::showSuccess,
+                this::showError
+        );
     }
 
     public Parent build() {
@@ -94,7 +100,7 @@ public class ChatView implements ChatListener {
         view.inputField.setOnAction(_ -> onSend());
         view.clearButton.setOnAction(_ -> session.clear());
         view.checkButton.setOnAction(_ -> session.checkAvailability());
-        view.saveButton.setOnAction(_ -> onSave());
+        view.saveButton.setOnAction(_ -> chatExport.onSave());
         view.copyLastButton.setOnAction(_ -> onCopyLast());
         view.stopButton.setOnAction(_ -> session.cancelCurrentRequest());
         view.regenerateButton.setOnAction(_ -> session.regenerateLast());
@@ -448,45 +454,6 @@ public class ChatView implements ChatListener {
         refreshServerSelector();
     }
 
-    private void onSave() {
-        List<AIChatMessage> history = new ArrayList<>(session.getHistory());
-        if (history.isEmpty()) {
-            return;
-        }
-
-        FileChooser chooser = new FileChooser();
-        chooser.setTitle("Save conversation");
-        chooser.setInitialFileName(defaultFileName());
-        chooser.getExtensionFilters().addAll(
-                new FileChooser.ExtensionFilter("Markdown (*.md)", "*.md"),
-                new FileChooser.ExtensionFilter("JSON (*.json)", "*.json"),
-                new FileChooser.ExtensionFilter("HTML (*.html)", "*.html"),
-                new FileChooser.ExtensionFilter("PDF (*.pdf)", "*.pdf"));
-
-        File file = chooser.showSaveDialog(window());
-        if (file == null) return;
-
-        try {
-            export(history, file);
-            showSuccess("Saved: " + file.getName());
-        } catch (IOException e) {
-            showError("Save failed: " + e.getMessage());
-        }
-    }
-
-    private void export(List<AIChatMessage> history, File file) throws IOException {
-        String name = file.getName().toLowerCase();
-        if (name.endsWith(".json")) {
-            ChatExporter.exportJson(history, file.toPath());
-        } else if (name.endsWith(".html")) {
-            ChatExporter.exportHtml(history, file.toPath());
-        } else if (name.endsWith(".pdf")) {
-            ChatExporter.exportPdf(history, file.toPath());
-        } else {
-            ChatExporter.exportMarkdown(history, file.toPath());
-        }
-    }
-
     private void onCopyLast() {
         AIChatMessage last = lastAssistantMessage();
         if (last == null) {
@@ -509,11 +476,6 @@ public class ChatView implements ChatListener {
             }
         }
         return null;
-    }
-
-    private String defaultFileName() {
-        String model = session.currentModel().replace(":", "-");
-        return "chat-" + model + "-" + LocalDate.now();
     }
 
     private void showInfo(String text) {
@@ -542,12 +504,6 @@ public class ChatView implements ChatListener {
             noticeTimer.play();
         });
     }
-
-
-
-
-
-
 
     private void renderTranscript() {
         String json = TranscriptJson.toJson(session.getHistory(), markdown);
