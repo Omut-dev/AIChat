@@ -1,11 +1,6 @@
 package omut.aichat.config;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import java.util.ArrayList;
 import java.util.List;
-import java.util.UUID;
 
 /**
  * Facade over bundled defaults ({@link AppDefaults}) and persisted
@@ -36,13 +31,12 @@ import java.util.UUID;
  */
 public class AppConfig {
 
-    private static final Logger log = LoggerFactory.getLogger(AppConfig.class);
-
     public static final String LOCAL_SERVER_ID = "local";
     public static final String DEFAULT_PROMPT_ID = "default";
 
     private final AppDefaults defaults = new AppDefaults();
     private final UserConfig userConfig;
+    private final PromptsRegistry promptsRegistry;
     private final ServersRegistry serversRegistry;
 
     private volatile String baseUrl;
@@ -59,12 +53,9 @@ public class AppConfig {
     AppConfig(UserConfig userConfig) {
         this.userConfig = userConfig;
         this.serversRegistry = new ServersRegistry(userConfig, defaults.baseUrl());
-
-        migrateLegacySystemPromptIfNeeded();
-        ensureDefaultPrompt();
-
+        this.promptsRegistry = new PromptsRegistry(userConfig, defaults.systemPrompt());
         this.baseUrl = serversRegistry.resolvedBaseUrl();
-        this.systemPrompt = deriveSystemPromptFromActivePrompt();
+        this.systemPrompt = promptsRegistry.activePromptText();
         this.temperature = resolveTemperature();
         this.requestTimeoutMinutes = resolveRequestTimeoutMinutes();
         this.historyMaxMessages = resolveHistoryMaxMessages();
@@ -112,11 +103,6 @@ public class AppConfig {
         return serversRegistry.serverBaseUrl(serverId);
     }
 
-    /** Convenience: derived URL of the active server. */
-    public String activeServerBaseUrl() {
-        return serversRegistry.activeServerBaseUrl();
-    }
-
     /**
      * Adds a new server with a generated id and returns that id. The
      * server is appended to the list; the active one is unchanged.
@@ -150,28 +136,22 @@ public class AppConfig {
 
     /** Ids of all configured prompts, in display order. Never empty. */
     public List<String> promptIds() {
-        return UserConfig.splitCsv(userConfig.getPromptsList());
+        return promptsRegistry.promptIds();
     }
 
     /** ID of the currently active prompt. Never {@code null}. */
     public String activePromptId() {
-        String id = userConfig.getActivePrompt();
-        if (id == null || id.isBlank() || !promptIds().contains(id)) {
-            userConfig.setActivePrompt(DEFAULT_PROMPT_ID);
-            return DEFAULT_PROMPT_ID;
-        }
-        return id;
+        return promptsRegistry.activePromptId();
     }
 
     /** Display name of the prompt with the given id, or the id itself. */
     public String promptName(String promptId) {
-        String name = userConfig.getPromptField(promptId, ConfigKeys.PROMPT_NAME_SUFFIX);
-        return (name == null || name.isBlank()) ? promptId : name;
+        return promptsRegistry.promptName(promptId);
     }
 
     /** Full text of the given prompt, or {@code null} if not set. */
     public String promptText(String promptId) {
-        return userConfig.getPromptField(promptId, ConfigKeys.PROMPT_TEXT_SUFFIX);
+        return promptsRegistry.promptText(promptId);
     }
 
     /**
@@ -179,48 +159,30 @@ public class AppConfig {
      * The prompt is appended to the list; the active one is unchanged.
      */
     public String addPrompt(String name, String text) {
-        String id = generateId("prm", promptIds());
-        userConfig.setPromptField(id, ConfigKeys.PROMPT_NAME_SUFFIX, name);
-        userConfig.setPromptField(id, ConfigKeys.PROMPT_TEXT_SUFFIX, text);
-
-        List<String> ids = new ArrayList<>(promptIds());
-        ids.add(id);
-        userConfig.setPromptsList(String.join(",", ids));
-        return id;
+        return promptsRegistry.addPrompt(name, text);
     }
 
     public void updatePrompt(String promptId, String name, String text) {
-        if (promptId == null || promptId.isBlank()) return;
-        if (!promptIds().contains(promptId)) return;
-
-        userConfig.setPromptField(promptId, ConfigKeys.PROMPT_NAME_SUFFIX, name);
-        userConfig.setPromptField(promptId, ConfigKeys.PROMPT_TEXT_SUFFIX, text);
-
-        if (promptId.equals(activePromptId())) {
-            this.systemPrompt = deriveSystemPromptFromActivePrompt();
+        promptsRegistry.updatePrompt(promptId, name, text);
+        if (promptId != null && promptId.equals(activePromptId())) {
+            this.systemPrompt = promptsRegistry.activePromptText();
         }
     }
 
     /**
      * Removes a non-default prompt. The {@code default} prompt cannot
-     * be removed. If the removed prompt was active, the active id
-     * falls back to {@code default}.
+     * be removed. If the removed prompt was active, the active id falls
+     * back to {@code default}.
      */
     public void removePrompt(String promptId) {
-        if (promptId == null || promptId.isBlank()) return;
-        if (DEFAULT_PROMPT_ID.equals(promptId)) return;
-        if (!promptIds().contains(promptId)) return;
-
-        userConfig.removePrompt(promptId);
-        this.systemPrompt = deriveSystemPromptFromActivePrompt();
+        promptsRegistry.removePrompt(promptId);
+        this.systemPrompt = promptsRegistry.activePromptText();
     }
 
     /** Switches the active prompt. Unknown ids are ignored. */
     public void setActivePrompt(String promptId) {
-        if (promptId == null || promptId.isBlank()) return;
-        if (!promptIds().contains(promptId)) return;
-        userConfig.setActivePrompt(promptId);
-        this.systemPrompt = deriveSystemPromptFromActivePrompt();
+        promptsRegistry.setActivePrompt(promptId);
+        this.systemPrompt = promptsRegistry.activePromptText();
     }
 
     public int requestTimeoutMinutes() {
@@ -351,61 +313,6 @@ public class AppConfig {
         return defaults.chatJsPath();
     }
 
-
-
-    private void migrateLegacySystemPromptIfNeeded() {
-        String existingList = userConfig.getPromptsList();
-        if (existingList != null && !existingList.isBlank()) {
-            return;
-        }
-
-        String legacy = userConfig.getSystemPrompt();
-        String text = (legacy != null && !legacy.isBlank())
-                ? legacy
-                : defaults.systemPrompt();
-
-        userConfig.setPromptField(
-                DEFAULT_PROMPT_ID, ConfigKeys.PROMPT_NAME_SUFFIX, "Default");
-        userConfig.setPromptField(
-                DEFAULT_PROMPT_ID, ConfigKeys.PROMPT_TEXT_SUFFIX, text);
-
-        userConfig.setPromptsList(DEFAULT_PROMPT_ID);
-        userConfig.setActivePrompt(DEFAULT_PROMPT_ID);
-        log.info("Migrated legacy system prompt to named prompt '{}'",
-                DEFAULT_PROMPT_ID);
-    }
-
-    private void ensureDefaultPrompt() {
-        List<String> ids = new ArrayList<>(promptIds());
-
-        if (!ids.contains(DEFAULT_PROMPT_ID)) {
-            ids.addFirst(DEFAULT_PROMPT_ID);
-            userConfig.setPromptsList(String.join(",", ids));
-            log.info("Self-heal: restored missing '{}' prompt entry",
-                    DEFAULT_PROMPT_ID);
-        }
-
-        if (userConfig.getPromptField(DEFAULT_PROMPT_ID, ConfigKeys.PROMPT_NAME_SUFFIX) == null) {
-            userConfig.setPromptField(
-                    DEFAULT_PROMPT_ID, ConfigKeys.PROMPT_NAME_SUFFIX, "Default");
-        }
-        if (userConfig.getPromptField(DEFAULT_PROMPT_ID, ConfigKeys.PROMPT_TEXT_SUFFIX) == null) {
-            userConfig.setPromptField(
-                    DEFAULT_PROMPT_ID, ConfigKeys.PROMPT_TEXT_SUFFIX, defaults.systemPrompt());
-        }
-
-        String active = userConfig.getActivePrompt();
-        if (active == null || active.isBlank() || !ids.contains(active)) {
-            userConfig.setActivePrompt(DEFAULT_PROMPT_ID);
-        }
-    }
-
-    private String deriveSystemPromptFromActivePrompt() {
-        String id = activePromptId();
-        String text = promptText(id);
-        return text != null ? text : defaults.systemPrompt();
-    }
-
     private double resolveTemperature() {
         Double userValue = userConfig.getTemperature();
         if (userValue != null) return userValue;
@@ -428,15 +335,5 @@ public class AppConfig {
         Integer userValue = userConfig.getAttachMaxChars();
         if (userValue != null) return userValue;
         return defaults.attachMaxChars();
-    }
-
-    private static String generateId(String prefix, List<String> existing) {
-        for (int attempt = 0; attempt < 16; attempt++) {
-            String candidate = prefix + "-"
-                    + UUID.randomUUID().toString().substring(0, 8);
-            if (!existing.contains(candidate)) return candidate;
-        }
-        throw new IllegalStateException(
-                "Could not allocate a unique id with prefix '" + prefix + "'");
     }
 }
