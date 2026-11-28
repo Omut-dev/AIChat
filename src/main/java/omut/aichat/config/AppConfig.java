@@ -1,6 +1,5 @@
 package omut.aichat.config;
 
-import omut.aichat.utils.UrlParser;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -17,7 +16,7 @@ import java.util.UUID;
  * reads {@code application.properties} belongs to AppDefaults;
  * anything that only persists user settings belongs to UserConfig.
  * <p>
- * Two collections are modelled on top of the flat storage, both with
+ * Two collections are modeled on top of the flat storage, both with
  * the same shape — a list of named items, one active, and one item
  * that cannot be removed:
  * <ul>
@@ -42,10 +41,9 @@ public class AppConfig {
     public static final String LOCAL_SERVER_ID = "local";
     public static final String DEFAULT_PROMPT_ID = "default";
 
-    private static final String DEFAULT_PROTOCOL = "http";
-
     private final AppDefaults defaults = new AppDefaults();
     private final UserConfig userConfig;
+    private final ServersRegistry serversRegistry;
 
     private volatile String baseUrl;
     private volatile String systemPrompt;
@@ -60,11 +58,12 @@ public class AppConfig {
 
     AppConfig(UserConfig userConfig) {
         this.userConfig = userConfig;
-        migrateLegacyBaseUrlIfNeeded();
-        ensureLocalServer();
+        this.serversRegistry = new ServersRegistry(userConfig, defaults.baseUrl());
+
         migrateLegacySystemPromptIfNeeded();
         ensureDefaultPrompt();
-        this.baseUrl = deriveBaseUrlFromActiveServer();
+
+        this.baseUrl = serversRegistry.resolvedBaseUrl();
         this.systemPrompt = deriveSystemPromptFromActivePrompt();
         this.temperature = resolveTemperature();
         this.requestTimeoutMinutes = resolveRequestTimeoutMinutes();
@@ -77,18 +76,13 @@ public class AppConfig {
     }
 
     /**
-     * Sets the URL of the <i>active</i> server, parsing protocol, host
+     * Sets the URL of the active server, parsing protocol, host
      * and port out of it. Other servers are untouched. Blank input
      * resets the active server's host/port to the bundled defaults.
      */
     public void setBaseUrl(String baseUrl) {
-        String normalized = UrlParser.normalize(baseUrl);
-        if (normalized == null) {
-            resetActiveServerToDefaults();
-        } else {
-            parseAndStoreActiveServer(normalized);
-        }
-        this.baseUrl = deriveBaseUrlFromActiveServer();
+        serversRegistry.setActiveServerBaseUrl(baseUrl);
+        this.baseUrl = serversRegistry.resolvedBaseUrl();
     }
 
     public String defaultBaseUrl() {
@@ -97,23 +91,17 @@ public class AppConfig {
 
     /** Ids of all configured servers, in display order. Never empty. */
     public List<String> serverIds() {
-        return UserConfig.splitCsv(userConfig.getServerList());
+        return serversRegistry.serverIds();
     }
 
-    /** Id of the currently active server. Never {@code null}. */
+    /** ID of the currently active server. Never {@code null}. */
     public String activeServerId() {
-        String id = userConfig.getActiveServer();
-        if (id == null || id.isBlank() || !serverIds().contains(id)) {
-            userConfig.setActiveServer(LOCAL_SERVER_ID);
-            return LOCAL_SERVER_ID;
-        }
-        return id;
+        return serversRegistry.activeServerId();
     }
 
     /** Display name of the server with the given id, or the id itself. */
     public String serverName(String serverId) {
-        String name = userConfig.getServerField(serverId, ConfigKeys.SERVER_NAME_SUFFIX);
-        return (name == null || name.isBlank()) ? serverId : name;
+        return serversRegistry.serverName(serverId);
     }
 
     /**
@@ -121,12 +109,12 @@ public class AppConfig {
      * has no host set.
      */
     public String serverBaseUrl(String serverId) {
-        return buildServerUrl(serverId);
+        return serversRegistry.serverBaseUrl(serverId);
     }
 
     /** Convenience: derived URL of the active server. */
     public String activeServerBaseUrl() {
-        return serverBaseUrl(activeServerId());
+        return serversRegistry.activeServerBaseUrl();
     }
 
     /**
@@ -134,28 +122,13 @@ public class AppConfig {
      * server is appended to the list; the active one is unchanged.
      */
     public String addServer(String name, String host, int port) {
-        String id = generateId("srv", serverIds());
-        userConfig.setServerField(id, ConfigKeys.SERVER_NAME_SUFFIX, name);
-        userConfig.setServerField(id, ConfigKeys.SERVER_PROTOCOL_SUFFIX, DEFAULT_PROTOCOL);
-        userConfig.setServerField(id, ConfigKeys.SERVER_HOST_SUFFIX, host);
-        userConfig.setServerField(id, ConfigKeys.SERVER_PORT_SUFFIX, Integer.toString(port));
-
-        List<String> ids = new ArrayList<>(serverIds());
-        ids.add(id);
-        userConfig.setServerList(String.join(",", ids));
-        return id;
+        return serversRegistry.addServer(name, host, port);
     }
 
     public void updateServer(String serverId, String name, String host, int port) {
-        if (serverId == null || serverId.isBlank()) return;
-        if (!serverIds().contains(serverId)) return;
-
-        userConfig.setServerField(serverId, ConfigKeys.SERVER_NAME_SUFFIX, name);
-        userConfig.setServerField(serverId, ConfigKeys.SERVER_HOST_SUFFIX, host);
-        userConfig.setServerField(serverId, ConfigKeys.SERVER_PORT_SUFFIX, Integer.toString(port));
-
-        if (serverId.equals(activeServerId())) {
-            this.baseUrl = deriveBaseUrlFromActiveServer();
+        serversRegistry.updateServer(serverId, name, host, port);
+        if (serverId != null && serverId.equals(activeServerId())) {
+            this.baseUrl = serversRegistry.resolvedBaseUrl();
         }
     }
 
@@ -165,20 +138,14 @@ public class AppConfig {
      * back to {@code local}.
      */
     public void removeServer(String serverId) {
-        if (serverId == null || serverId.isBlank()) return;
-        if (LOCAL_SERVER_ID.equals(serverId)) return;
-        if (!serverIds().contains(serverId)) return;
-
-        userConfig.removeServer(serverId);
-        this.baseUrl = deriveBaseUrlFromActiveServer();
+        serversRegistry.removeServer(serverId);
+        this.baseUrl = serversRegistry.resolvedBaseUrl();
     }
 
     /** Switches the active server. Unknown ids are ignored. */
     public void setActiveServer(String serverId) {
-        if (serverId == null || serverId.isBlank()) return;
-        if (!serverIds().contains(serverId)) return;
-        userConfig.setActiveServer(serverId);
-        this.baseUrl = deriveBaseUrlFromActiveServer();
+        serversRegistry.setActiveServer(serverId);
+        this.baseUrl = serversRegistry.resolvedBaseUrl();
     }
 
     /** Ids of all configured prompts, in display order. Never empty. */
@@ -186,7 +153,7 @@ public class AppConfig {
         return UserConfig.splitCsv(userConfig.getPromptsList());
     }
 
-    /** Id of the currently active prompt. Never {@code null}. */
+    /** ID of the currently active prompt. Never {@code null}. */
     public String activePromptId() {
         String id = userConfig.getActivePrompt();
         if (id == null || id.isBlank() || !promptIds().contains(id)) {
@@ -384,78 +351,7 @@ public class AppConfig {
         return defaults.chatJsPath();
     }
 
-    private void migrateLegacyBaseUrlIfNeeded() {
-        String existingList = userConfig.getServerList();
-        if (existingList != null && !existingList.isBlank()) {
-            return;
-        }
 
-        String legacy = userConfig.getBaseUrl();
-        String source = (legacy != null && !legacy.isBlank())
-                ? legacy
-                : defaults.baseUrl();
-
-        UrlParser.Parsed parsed = UrlParser.parse(source);
-        if (parsed == null) {
-            parsed = UrlParser.parse(defaults.baseUrl());
-        }
-        if (parsed == null) {
-            log.warn("Cannot parse bundled default base URL: {}", defaults.baseUrl());
-            parsed = new UrlParser.Parsed(
-                    UrlParser.DEFAULT_PROTOCOL, "127.0.0.1", UrlParser.DEFAULT_PORT);
-        }
-
-        userConfig.setServerField(
-                LOCAL_SERVER_ID, ConfigKeys.SERVER_NAME_SUFFIX, "Local");
-        userConfig.setServerField(
-                LOCAL_SERVER_ID, ConfigKeys.SERVER_PROTOCOL_SUFFIX, parsed.protocol());
-        userConfig.setServerField(
-                LOCAL_SERVER_ID, ConfigKeys.SERVER_HOST_SUFFIX, parsed.host());
-        userConfig.setServerField(
-                LOCAL_SERVER_ID, ConfigKeys.SERVER_PORT_SUFFIX,
-                Integer.toString(parsed.port()));
-
-        userConfig.setServerList(LOCAL_SERVER_ID);
-        userConfig.setActiveServer(LOCAL_SERVER_ID);
-        log.info("Migrated legacy base URL to named server '{}': {}",
-                LOCAL_SERVER_ID, source);
-    }
-
-    private void ensureLocalServer() {
-        List<String> ids = new ArrayList<>(serverIds());
-
-        if (!ids.contains(LOCAL_SERVER_ID)) {
-            ids.add(0, LOCAL_SERVER_ID);
-            userConfig.setServerList(String.join(",", ids));
-            log.info("Self-heal: restored missing '{}' server entry", LOCAL_SERVER_ID);
-        }
-
-        if (userConfig.getServerField(LOCAL_SERVER_ID, ConfigKeys.SERVER_NAME_SUFFIX) == null) {
-            userConfig.setServerField(
-                    LOCAL_SERVER_ID, ConfigKeys.SERVER_NAME_SUFFIX, "Local");
-        }
-        if (userConfig.getServerField(LOCAL_SERVER_ID, ConfigKeys.SERVER_PROTOCOL_SUFFIX) == null) {
-            userConfig.setServerField(
-                    LOCAL_SERVER_ID, ConfigKeys.SERVER_PROTOCOL_SUFFIX, DEFAULT_PROTOCOL);
-        }
-        if (userConfig.getServerField(LOCAL_SERVER_ID, ConfigKeys.SERVER_HOST_SUFFIX) == null) {
-            UrlParser.Parsed d = UrlParser.parse(defaults.baseUrl());
-            String host = (d != null) ? d.host() : "127.0.0.1";
-            userConfig.setServerField(
-                    LOCAL_SERVER_ID, ConfigKeys.SERVER_HOST_SUFFIX, host);
-        }
-        if (userConfig.getServerField(LOCAL_SERVER_ID, ConfigKeys.SERVER_PORT_SUFFIX) == null) {
-            UrlParser.Parsed d = UrlParser.parse(defaults.baseUrl());
-            int port = (d != null) ? d.port() : UrlParser.DEFAULT_PORT;
-            userConfig.setServerField(
-                    LOCAL_SERVER_ID, ConfigKeys.SERVER_PORT_SUFFIX, Integer.toString(port));
-        }
-
-        String active = userConfig.getActiveServer();
-        if (active == null || active.isBlank() || !ids.contains(active)) {
-            userConfig.setActiveServer(LOCAL_SERVER_ID);
-        }
-    }
 
     private void migrateLegacySystemPromptIfNeeded() {
         String existingList = userConfig.getPromptsList();
@@ -483,7 +379,7 @@ public class AppConfig {
         List<String> ids = new ArrayList<>(promptIds());
 
         if (!ids.contains(DEFAULT_PROMPT_ID)) {
-            ids.add(0, DEFAULT_PROMPT_ID);
+            ids.addFirst(DEFAULT_PROMPT_ID);
             userConfig.setPromptsList(String.join(",", ids));
             log.info("Self-heal: restored missing '{}' prompt entry",
                     DEFAULT_PROMPT_ID);
@@ -504,59 +400,10 @@ public class AppConfig {
         }
     }
 
-    private String deriveBaseUrlFromActiveServer() {
-        String id = activeServerId();
-        String url = buildServerUrl(id);
-        if (url != null) return url;
-        return defaults.baseUrl();
-    }
-
     private String deriveSystemPromptFromActivePrompt() {
         String id = activePromptId();
         String text = promptText(id);
         return text != null ? text : defaults.systemPrompt();
-    }
-
-    private String buildServerUrl(String serverId) {
-        String protocol = userConfig.getServerField(
-                serverId, ConfigKeys.SERVER_PROTOCOL_SUFFIX);
-        String host = userConfig.getServerField(
-                serverId, ConfigKeys.SERVER_HOST_SUFFIX);
-        String port = userConfig.getServerField(
-                serverId, ConfigKeys.SERVER_PORT_SUFFIX);
-
-        if (host == null || host.isBlank()) return null;
-        if (protocol == null || protocol.isBlank()) protocol = DEFAULT_PROTOCOL;
-        if (port == null || port.isBlank()) port = String.valueOf(UrlParser.DEFAULT_PORT);
-
-        return protocol + "://" + host + ":" + port;
-    }
-
-    private void parseAndStoreActiveServer(String url) {
-        UrlParser.Parsed parsed = UrlParser.parse(url);
-        if (parsed == null) {
-            log.warn("Cannot parse URL for active server: {}", url);
-            return;
-        }
-        String id = activeServerId();
-        userConfig.setServerField(
-                id, ConfigKeys.SERVER_PROTOCOL_SUFFIX, parsed.protocol());
-        userConfig.setServerField(
-                id, ConfigKeys.SERVER_HOST_SUFFIX, parsed.host());
-        userConfig.setServerField(
-                id, ConfigKeys.SERVER_PORT_SUFFIX, Integer.toString(parsed.port()));
-    }
-
-    private void resetActiveServerToDefaults() {
-        UrlParser.Parsed parsed = UrlParser.parse(defaults.baseUrl());
-        if (parsed == null) return;
-        String id = activeServerId();
-        userConfig.setServerField(
-                id, ConfigKeys.SERVER_PROTOCOL_SUFFIX, parsed.protocol());
-        userConfig.setServerField(
-                id, ConfigKeys.SERVER_HOST_SUFFIX, parsed.host());
-        userConfig.setServerField(
-                id, ConfigKeys.SERVER_PORT_SUFFIX, Integer.toString(parsed.port()));
     }
 
     private double resolveTemperature() {
