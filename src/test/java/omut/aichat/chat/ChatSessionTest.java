@@ -12,6 +12,8 @@ import java.util.concurrent.AbstractExecutorService;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -954,9 +956,9 @@ class ChatSessionTest {
             verify(llm, never()).rebuildModel();
 
             releaseStream.countDown();
-            awaitIdle();
 
-            verify(llm, times(1)).rebuildModel();
+            verify(llm, timeout(2_000).times(1)).rebuildModel();
+            awaitIdle();
         }
 
         @Test
@@ -1264,6 +1266,153 @@ class ChatSessionTest {
             public boolean awaitTermination(long timeout, @NonNull TimeUnit unit) {
                 return shutdown;
             }
+        }
+    }
+
+    @Test
+    void cancelBeforeRequestSubmissionSkipsExecutorExecution() {
+        RejectingExecutorService executor = new RejectingExecutorService(null);
+        session.shutdown();
+
+        session = new ChatSession(llm, config, executor);
+
+        ChatListener cancellingListener = mock(ChatListener.class);
+
+        doAnswer(_ -> {
+            session.cancelCurrentRequest();
+            return null;
+        }).when(cancellingListener).onThinkingStarted();
+
+        session.addListener(cancellingListener);
+
+        try {
+            session.send("hello");
+
+            assertThat(executor.executeCalls()).isZero();
+
+            verify(llm, never()).askStreaming(any(), any());
+            verify(cancellingListener).onRequestCancelled();
+            verify(cancellingListener).onThinkingFinished();
+        } finally {
+            session.shutdown();
+        }
+    }
+
+    @Test
+    void rejectedSubmissionAllowsNextRequest() {
+        RejectingExecutorService executor = new RejectingExecutorService(null);
+        session.shutdown();
+
+        session = new ChatSession(llm, config, executor);
+
+        ChatListener lifecycleListener = mock(ChatListener.class);
+        session.addListener(lifecycleListener);
+
+        completeImmediately("reply", 1);
+
+        try {
+            session.send("first");
+
+            verify(lifecycleListener, times(1)).onThinkingFinished();
+            verify(llm, never()).askStreaming(any(), any());
+
+            session.send("second");
+
+            verify(llm, times(1)).askStreaming(any(), any());
+            verify(lifecycleListener, times(2)).onThinkingFinished();
+        } finally {
+            session.shutdown();
+        }
+    }
+
+    @Test
+    void rejectedSubmissionAfterCancellationDoesNotFinishGenerationTwice() {
+        AtomicReference<ChatSession> sessionReference = new AtomicReference<>();
+
+        RejectingExecutorService executor = new RejectingExecutorService(
+                () -> sessionReference.get().cancelCurrentRequest()
+        );
+
+        session.shutdown();
+
+        session = new ChatSession(llm, config, executor);
+        sessionReference.set(session);
+
+        ChatListener lifecycleListener = mock(ChatListener.class);
+        session.addListener(lifecycleListener);
+
+        try {
+            session.send("hello");
+
+            verify(lifecycleListener).onRequestCancelled();
+            verify(lifecycleListener, times(1)).onThinkingFinished();
+            verify(llm, never()).askStreaming(any(), any());
+        } finally {
+            session.shutdown();
+        }
+    }
+
+    private static final class RejectingExecutorService extends AbstractExecutorService {
+
+        private final AtomicReference<Runnable> beforeReject;
+        private final AtomicBoolean rejectNext = new AtomicBoolean(true);
+        private final AtomicInteger executeCalls = new AtomicInteger();
+
+        private volatile boolean shutdown;
+
+        private RejectingExecutorService(Runnable beforeReject) {
+            this.beforeReject = new AtomicReference<>(beforeReject);
+        }
+
+        @Override
+        public void execute(@NonNull Runnable command) {
+            executeCalls.incrementAndGet();
+
+            if (shutdown) {
+                throw new RejectedExecutionException("Executor is shut down");
+            }
+
+            if (rejectNext.compareAndSet(true, false)) {
+                Runnable action = beforeReject.getAndSet(null);
+
+                if (action != null) {
+                    action.run();
+                }
+
+                throw new RejectedExecutionException("Test rejection");
+            }
+
+            command.run();
+        }
+
+        int executeCalls() {
+            return executeCalls.get();
+        }
+
+        @Override
+        public void shutdown() {
+            shutdown = true;
+        }
+
+        @Override
+        public @NonNull List<Runnable> shutdownNow() {
+            shutdown = true;
+            return List.of();
+        }
+
+        @Override
+        public boolean isShutdown() {
+            return shutdown;
+        }
+
+        @Override
+        public boolean isTerminated() {
+            return shutdown;
+        }
+
+        @Override
+        public boolean awaitTermination(long timeout, @NonNull TimeUnit unit) {
+            return shutdown;
         }
     }
 }
