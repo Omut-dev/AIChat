@@ -3,11 +3,14 @@ package omut.aichat.chat;
 import omut.aichat.config.AppConfig;
 import omut.aichat.config.AppSettings;
 import omut.aichat.service.LlmService;
+import org.jspecify.annotations.NonNull;
 import org.junit.jupiter.api.*;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.AbstractExecutorService;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -1154,6 +1157,113 @@ class ChatSessionTest {
             long duration = System.currentTimeMillis() - start;
 
             assertThat(duration).isLessThan(3000);
+        }
+
+        @Test
+        void cancelDuringSubmissionCancelsQueuedRequest() throws Exception {
+            ControlledExecutorService executor = new ControlledExecutorService();
+
+            session.shutdown();
+            session = new ChatSession(llm, config, executor);
+            session.addListener(listener);
+
+            AtomicReference<Throwable> senderFailure = new AtomicReference<>();
+            Thread sender = new Thread(() -> {
+                try {
+                    session.send("hello");
+                } catch (Throwable error) {
+                    senderFailure.set(error);
+                }
+            });
+
+            sender.start();
+
+            try {
+                assertThat(executor.awaitExecuteEntered()).isTrue();
+
+                session.cancelCurrentRequest();
+
+                executor.releaseExecute();
+
+                sender.join(TimeUnit.SECONDS.toMillis(2));
+
+                assertThat(sender.isAlive()).isFalse();
+                assertThat(senderFailure.get()).isNull();
+
+                executor.runSubmittedTask();
+
+                verify(llm, never()).askStreaming(any(), any());
+            } finally {
+                executor.releaseExecute();
+                sender.join(TimeUnit.SECONDS.toMillis(2));
+                session.shutdown();
+            }
+        }
+
+        private static final class ControlledExecutorService extends AbstractExecutorService {
+
+            private final CountDownLatch executeEntered = new CountDownLatch(1);
+            private final CountDownLatch allowExecuteReturn = new CountDownLatch(1);
+            private final AtomicReference<Runnable> submittedTask = new AtomicReference<>();
+
+            private volatile boolean shutdown;
+
+            @Override
+            public void execute(@NonNull Runnable command) {
+                submittedTask.set(command);
+                executeEntered.countDown();
+
+                try {
+                    if (!allowExecuteReturn.await(2, TimeUnit.SECONDS)) {
+                        throw new RejectedExecutionException("Test timeout");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RejectedExecutionException(e);
+                }
+            }
+
+            boolean awaitExecuteEntered() throws InterruptedException {
+                return executeEntered.await(2, TimeUnit.SECONDS);
+            }
+
+            void releaseExecute() {
+                allowExecuteReturn.countDown();
+            }
+
+            void runSubmittedTask() {
+                Runnable task = submittedTask.get();
+                assertThat(task).isNotNull();
+                task.run();
+            }
+
+            @Override
+            public void shutdown() {
+                shutdown = true;
+                releaseExecute();
+            }
+
+            @Override
+            public @NonNull List<Runnable> shutdownNow() {
+                shutdown = true;
+                releaseExecute();
+                return List.of();
+            }
+
+            @Override
+            public boolean isShutdown() {
+                return shutdown;
+            }
+
+            @Override
+            public boolean isTerminated() {
+                return shutdown;
+            }
+
+            @Override
+            public boolean awaitTermination(long timeout, @NonNull TimeUnit unit) {
+                return shutdown;
+            }
         }
     }
 }
